@@ -1,0 +1,42 @@
+{
+  "_comment": "Wide 100-ticker universe scanned on 5-minute bars via yfinance. Combines the breadth of wide_yfinance with the intraday-tuned thresholds of intraday_5m. IBKR would hit rate limits with this universe; use yfinance only. Remember yfinance 5m bars are ~15 min delayed — fine for building an intraday watchlist, not for live entry timing.",
+  "universe": {
+    "min_price": 5.0,
+    "max_price": 2000.0,
+    "min_avg_volume": 30000,
+    "min_dollar_volume": 2000000
+  },
+  "thresholds": {
+    "min_relative_volume": 1.8,
+    "min_gap_pct": 0.5,
+    "max_gap_pct": 10.0,
+    "rsi_min": 45.0,
+    "rsi_max": 72.0,
+    "breakout_proximity_pct": 0.3,
+    "require_above_vwap": true,
+    "require_above_ema9": true,
+    "require_ema9_above_ema20": true
+  },
+  "weights": {
+    "relative_volume": 0.35,
+    "momentum": 0.25,
+    "trend_alignment": 0.20,
+    "rsi_position": 0.05,
+    "breakout_proximity": 0.15
+  },
+  "default_tickers": [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "ORCL", "ADBE", "CRM", "NOW",
+    "INTU", "IBM", "CSCO", "ACN", "TXN", "SAP",
+    "AMD", "AVGO", "TSM", "MU", "QCOM", "INTC", "ARM", "MRVL", "LRCX", "AMAT", "KLAC", "ASML", "SMCI", "ON",
+    "JPM", "BAC", "GS", "MS", "V", "MA", "AXP", "SCHW", "WFC", "C", "BLK", "SPGI",
+    "WMT", "COST", "HD", "NKE", "MCD", "SBUX", "TGT", "LOW", "DIS", "CMG", "PEP", "KO", "PG",
+    "UNH", "JNJ", "LLY", "PFE", "ABBV", "TMO", "MRK", "ABT", "DHR", "BMY",
+    "CAT", "BA", "DE", "GE", "HON", "UPS", "FDX", "RTX", "LMT", "NOC",
+    "XOM", "CVX", "COP", "SLB", "OXY", "EOG",
+    "TSLA", "NFLX", "COIN", "PLTR", "SNOW", "SHOP", "UBER", "ABNB",
+    "HOOD", "SOFI", "RBLX", "DASH", "PINS", "NET", "DDOG", "CRWD", "ZS", "PANW", "MDB"
+  ],
+  "top_n_results": 25,
+  "interval": "5m",
+  "lookback_days": 5
+}

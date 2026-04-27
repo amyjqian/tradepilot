@@ -1,0 +1,40 @@
+{
+  "_comment": "Preset for 5-minute intraday day-trading via IBKR. Universe floors are per-bar (20 × 5m = 100 minutes of history), so the daily-bar defaults would filter out nearly everything. These floors roughly target liquid US names with >$5M per 5m bar of dollar volume.",
+  "universe": {
+    "min_price": 5.0,
+    "max_price": 1000.0,
+    "min_avg_volume": 30000,
+    "min_dollar_volume": 2000000
+  },
+  "thresholds": {
+    "min_relative_volume": 1.8,
+    "min_gap_pct": 0.5,
+    "max_gap_pct": 10.0,
+    "rsi_min": 45.0,
+    "rsi_max": 72.0,
+    "breakout_proximity_pct": 0.3,
+    "require_above_vwap": true,
+    "require_above_ema9": true,
+    "require_ema9_above_ema20": true
+  },
+  "weights": {
+    "relative_volume": 0.35,
+    "momentum": 0.25,
+    "trend_alignment": 0.20,
+    "rsi_position": 0.05,
+    "breakout_proximity": 0.15
+  },
+  "default_tickers": [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA",
+    "AMD", "AVGO", "TSM", "MU", "QCOM", "INTC",
+    "JPM", "BAC", "GS", "MS", "V", "MA",
+    "WMT", "COST", "HD", "NKE", "MCD",
+    "UNH", "JNJ", "LLY", "PFE",
+    "CAT", "BA", "DE",
+    "XOM", "CVX",
+    "TSLA", "NFLX", "CRM", "COIN", "PLTR", "SNOW", "SHOP", "UBER", "ORCL", "ADBE"
+  ],
+  "top_n_results": 20,
+  "interval": "5m",
+  "lookback_days": 5
+}

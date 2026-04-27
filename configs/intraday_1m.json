@@ -1,0 +1,35 @@
+{
+  "_comment": "Preset for 1-minute intraday scalping via IBKR. IB caps 1-min requests at 1 day of history per request, so lookback_days=1 is the max you can fetch in one call. Per-bar volume floors are 1/5 of the 5m preset.",
+  "universe": {
+    "min_price": 5.0,
+    "max_price": 1000.0,
+    "min_avg_volume": 8000,
+    "min_dollar_volume": 500000
+  },
+  "thresholds": {
+    "min_relative_volume": 2.0,
+    "min_gap_pct": 0.3,
+    "max_gap_pct": 8.0,
+    "rsi_min": 45.0,
+    "rsi_max": 75.0,
+    "breakout_proximity_pct": 0.2,
+    "require_above_vwap": true,
+    "require_above_ema9": true,
+    "require_ema9_above_ema20": true
+  },
+  "weights": {
+    "relative_volume": 0.40,
+    "momentum": 0.25,
+    "trend_alignment": 0.20,
+    "rsi_position": 0.05,
+    "breakout_proximity": 0.10
+  },
+  "default_tickers": [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA",
+    "AMD", "AVGO", "TSM", "MU", "QCOM",
+    "TSLA", "NFLX", "CRM", "COIN", "PLTR", "SHOP", "UBER", "ORCL"
+  ],
+  "top_n_results": 15,
+  "interval": "1m",
+  "lookback_days": 1
+}

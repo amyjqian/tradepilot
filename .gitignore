@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Node / frontend
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+*.log
+.vite/
+
+# Project outputs
+output/
+data_cache/
+*.parquet
+
+# Editor / IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Env
+.env
+.env.local

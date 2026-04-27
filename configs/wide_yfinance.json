@@ -1,0 +1,42 @@
+{
+  "_comment": "Wide 100-ticker universe for pre-market / overnight scans on yfinance. yfinance batches the whole list into one HTTP call, so 100 tickers costs the same as 10. Use interval=1d for EOD screens, or 5m/15m with the understanding that yfinance bars are ~15 min delayed — fine for building a watchlist, not for live entries. Do NOT use with IBKR (would take ~20s and eat the 10-min pacing budget).",
+  "universe": {
+    "min_price": 3.0,
+    "max_price": 2000.0,
+    "min_avg_volume": 200000,
+    "min_dollar_volume": 5000000
+  },
+  "thresholds": {
+    "min_relative_volume": 1.5,
+    "min_gap_pct": 1.0,
+    "max_gap_pct": 15.0,
+    "rsi_min": 50.0,
+    "rsi_max": 72.0,
+    "breakout_proximity_pct": 0.5,
+    "require_above_vwap": true,
+    "require_above_ema9": true,
+    "require_ema9_above_ema20": true
+  },
+  "weights": {
+    "relative_volume": 0.30,
+    "momentum": 0.25,
+    "trend_alignment": 0.20,
+    "rsi_position": 0.10,
+    "breakout_proximity": 0.15
+  },
+  "default_tickers": [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "ORCL", "ADBE", "CRM", "NOW",
+    "INTU", "IBM", "CSCO", "ACN", "TXN", "SAP",
+    "AMD", "AVGO", "TSM", "MU", "QCOM", "INTC", "ARM", "MRVL", "LRCX", "AMAT", "KLAC", "ASML", "SMCI", "ON",
+    "JPM", "BAC", "GS", "MS", "V", "MA", "AXP", "SCHW", "WFC", "C", "BLK", "SPGI",
+    "WMT", "COST", "HD", "NKE", "MCD", "SBUX", "TGT", "LOW", "DIS", "CMG", "PEP", "KO", "PG",
+    "UNH", "JNJ", "LLY", "PFE", "ABBV", "TMO", "MRK", "ABT", "DHR", "BMY",
+    "CAT", "BA", "DE", "GE", "HON", "UPS", "FDX", "RTX", "LMT", "NOC",
+    "XOM", "CVX", "COP", "SLB", "OXY", "EOG",
+    "TSLA", "NFLX", "COIN", "PLTR", "SNOW", "SHOP", "UBER", "ABNB",
+    "HOOD", "SOFI", "RBLX", "DASH", "PINS", "NET", "DDOG", "CRWD", "ZS", "PANW", "MDB"
+  ],
+  "top_n_results": 25,
+  "interval": "1d",
+  "lookback_days": 90
+}
