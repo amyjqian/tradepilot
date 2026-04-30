@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { ScanResult } from '../types'
 import { fmtCurrency, fmtMultiplier, fmtNumber, fmtPct } from '../format'
 import { ScoreBreakdown } from './ScoreBreakdown'
+import { TradingViewChart } from './TradingViewChart'
 
 interface Props {
   results: ScanResult[]
@@ -119,33 +120,41 @@ export function ScanTable({ results }: Props) {
                 {isOpen && (
                   <tr className="border-b border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-900/40">
                     <td colSpan={8} className="px-3 py-4">
-                      <div className="grid gap-4 lg:grid-cols-2">
-                        <div>
-                          <div className="mb-2 text-xs uppercase tracking-wide text-neutral-500">
-                            Signal strengths
+                      <div className="space-y-4">
+                        <div className="grid gap-4 lg:grid-cols-2">
+                          <div>
+                            <div className="mb-2 text-xs uppercase tracking-wide text-neutral-500">
+                              Signal strengths
+                            </div>
+                            <ScoreBreakdown signals={r.signals} />
                           </div>
-                          <ScoreBreakdown signals={r.signals} />
+                          <div>
+                            <div className="mb-2 text-xs uppercase tracking-wide text-neutral-500">
+                              Reasons
+                            </div>
+                            <ul className="list-disc pl-5 text-sm">
+                              {r.reasons.length === 0 && (
+                                <li className="text-neutral-500">No qualitative factors</li>
+                              )}
+                              {r.reasons.map((reason, i) => (
+                                <li key={i}>{reason}</li>
+                              ))}
+                            </ul>
+                            <a
+                              className="mt-3 inline-block text-xs text-[var(--color-accent-dim)] hover:underline"
+                              href={`https://www.tradingview.com/chart/?symbol=${r.ticker}`}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Open {r.ticker} on TradingView →
+                            </a>
+                          </div>
                         </div>
                         <div>
                           <div className="mb-2 text-xs uppercase tracking-wide text-neutral-500">
-                            Reasons
+                            Chart — EMA(9) · RSI(9)
                           </div>
-                          <ul className="list-disc pl-5 text-sm">
-                            {r.reasons.length === 0 && (
-                              <li className="text-neutral-500">No qualitative factors</li>
-                            )}
-                            {r.reasons.map((reason, i) => (
-                              <li key={i}>{reason}</li>
-                            ))}
-                          </ul>
-                          <a
-                            className="mt-3 inline-block text-xs text-[var(--color-accent-dim)] hover:underline"
-                            href={`https://www.tradingview.com/chart/?symbol=${r.ticker}`}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Open {r.ticker} on TradingView →
-                          </a>
+                          <TradingViewChart ticker={r.ticker} />
                         </div>
                       </div>
                     </td>
