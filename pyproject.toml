@@ -24,7 +24,7 @@ plugins = ["pydantic.mypy"]
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["yfinance.*", "pyarrow.*", "ib_async.*"]
+module = ["yfinance.*", "pyarrow.*", "ib_async.*", "alpaca.*"]
 ignore_missing_imports = true
 disable_error_code = ["no-untyped-call", "no-any-return"]
 

@@ -9,23 +9,33 @@ wrapped provider, saving IB pacing budget.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from scanner.backtest import backtest
+from scanner.broker import IBBroker, Journal, KillSwitchActive, get_broker
 from scanner.config import ScannerConfig
 from scanner.data import MarketDataProvider, get_provider
 from scanner.data.ib_provider import PacingBudgetExhausted
 from scanner.engine import scan
+from scanner.sector_rotation import (
+    SECTOR_ETFS,
+    SPY_BENCHMARK,
+    get_active_constituents,
+    run_sector_rotation,
+)
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +65,24 @@ class _State:
         self.cache_ttl_sec: float = 60.0
         self._providers: dict[str, MarketDataProvider] = {}
         self._providers_lock = threading.Lock()
+        self._broker: IBBroker | None | _Sentinel = _UNSET
+        self._broker_lock = threading.Lock()
+
+    def broker(self) -> IBBroker | None:
+        """Return the configured broker, or None if intentionally disabled.
+
+        Cached after the first attempt. The connection itself is lazy
+        inside IBBroker; this just builds the wrapper so we don't re-read
+        env vars on every request.
+        """
+        with self._broker_lock:
+            if self._broker is _UNSET:
+                self._broker = get_broker()
+            return self._broker  # type: ignore[return-value]
+
+    def reset_broker(self) -> None:
+        with self._broker_lock:
+            self._broker = _UNSET
 
     def cache_get(self, key: str) -> dict[str, Any] | None:
         with self._cache_lock:
@@ -95,6 +123,24 @@ class _State:
                 disconnect()
             except Exception:
                 log.exception("Provider %s disconnect failed", name)
+        # Disconnect the broker too so its background loop thread exits.
+        with self._broker_lock:
+            broker = self._broker if not isinstance(self._broker, _Sentinel) else None
+            self._broker = _UNSET
+        if broker is not None:
+            disc = getattr(broker, "disconnect", None)
+            if callable(disc):
+                try:
+                    disc()
+                except Exception:
+                    log.exception("Broker disconnect failed")
+
+
+class _Sentinel:
+    """Distinguishes 'broker not yet probed' from 'probed and unavailable'."""
+
+
+_UNSET = _Sentinel()
 
 
 _state = _State()
@@ -129,6 +175,41 @@ class BacktestRequest(BaseModel):
     holding_bars: int = 3
     target_pct: float = 2.0
     min_history: int = 30
+
+
+class SectorRotationRequest(BaseModel):
+    provider: str = Field(default="synthetic")
+    interval: str | None = None
+    lookback_days: int | None = None
+    top_n: int = Field(default=2, ge=1, le=5)
+
+
+class WatchlistRequest(BaseModel):
+    tickers: list[str]
+
+
+class OrderRequest(BaseModel):
+    symbol: str
+    qty: float
+    side: str  # "buy" / "sell"
+    type: str = "market"  # "market" / "limit" / "pegprim"
+    time_in_force: str = "day"
+    limit_price: float | None = None
+    client_order_id: str | None = None
+    # Captured at submit time so the journal can compute R-multiple and
+    # tag the trade with the entry score. Both optional — orders placed
+    # outside the dashboard (e.g. via TWS directly) won't carry these.
+    planned_stop: float | None = None
+    score_at_entry: float | None = None
+    # Pegged-to-Primary (REL) parameters. Required when type == "pegprim".
+    # `peg_offset` is the auxPrice tick offset above bid (BUY) or below
+    # ask (SELL). `cap_price` is the hard limit price (ceiling for BUY,
+    # floor for SELL).
+    peg_offset: float | None = None
+    cap_price: float | None = None
+    # Optional IB account to route the order to. Must be in the broker's
+    # managed-accounts list. None → broker's default account.
+    account: str | None = None
 
 
 @app.get("/health")
@@ -290,3 +371,386 @@ def post_backtest(req: BacktestRequest) -> dict[str, Any]:
         }
     )
     return payload
+
+
+@app.post("/scan/sector-rotation")
+def post_sector_rotation(req: SectorRotationRequest) -> dict[str, Any]:
+    """Two-stage scan: rank sector ETFs, then run scanner on top sector's constituents."""
+    cfg = _resolve_cfg(req)  # type: ignore[arg-type]
+
+    try:
+        provider = _state.provider(req.provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    sector_tickers = list(SECTOR_ETFS.keys()) + [SPY_BENCHMARK]
+    # Use the live SSGA-backed map when available; falls back to the
+    # hardcoded snapshot. Without this, tickers added to a sector since
+    # the hardcoded list was curated would be silently dropped from the
+    # scan because we never fetched their bars.
+    active_map, _source = get_active_constituents()
+    constituent_universe = sorted({t for tickers in active_map.values() for t in tickers})
+
+    try:
+        sector_data = provider.get_bars_batch(sector_tickers, cfg.interval, cfg.lookback_days)
+        spy_df = sector_data.pop(SPY_BENCHMARK, None)
+        constituent_data = provider.get_bars_batch(
+            constituent_universe, cfg.interval, cfg.lookback_days
+        )
+    except PacingBudgetExhausted as exc:
+        retry = max(1, int(round(exc.retry_after_sec)))
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(retry)},
+        ) from exc
+    except Exception as exc:
+        log.exception("Sector-rotation data fetch failed")
+        raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc!r}") from exc
+
+    report = run_sector_rotation(
+        sector_data, spy_df, constituent_data, cfg, top_n=req.top_n,
+    )
+    payload = report.to_dict()
+    payload.update(
+        {
+            "ran_at": datetime.now(UTC).isoformat(),
+            "provider": req.provider,
+            "interval": cfg.interval,
+            "lookback_days": cfg.lookback_days,
+        }
+    )
+    return payload
+
+
+_WATCHLIST_PATH = Path(__file__).resolve().parent.parent / "configs" / "watchlist.json"
+
+
+def _read_watchlist() -> list[str]:
+    if not _WATCHLIST_PATH.exists():
+        return list(_state.config.default_tickers)
+    try:
+        import json
+
+        with _WATCHLIST_PATH.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        tickers = payload.get("tickers", [])
+        return [str(t).upper() for t in tickers if t]
+    except Exception as exc:
+        log.warning("Failed to read watchlist: %s", exc)
+        return list(_state.config.default_tickers)
+
+
+def _write_watchlist(tickers: list[str]) -> list[str]:
+    import json
+
+    cleaned = [t.strip().upper() for t in tickers if t and t.strip()]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for t in cleaned:
+        if t not in seen:
+            deduped.append(t)
+            seen.add(t)
+    _WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _WATCHLIST_PATH.open("w", encoding="utf-8") as fh:
+        json.dump({"tickers": deduped}, fh, indent=2)
+    return deduped
+
+
+@app.get("/watchlist")
+def get_watchlist() -> dict[str, list[str]]:
+    return {"tickers": _read_watchlist()}
+
+
+@app.put("/watchlist")
+def put_watchlist(req: WatchlistRequest) -> dict[str, list[str]]:
+    return {"tickers": _write_watchlist(req.tickers)}
+
+
+@app.get("/broker/status")
+def broker_status() -> dict[str, Any]:
+    """Lightweight probe — does the API have IBKR wired up?
+
+    The broker is wired up by default; we only return `connected: false`
+    when `IB_BROKER_DISABLED=1` is set. Connection failures (TWS not
+    running, wrong port, etc.) surface as 502 on /broker/account when
+    the user actually tries to use it — there's no point pre-connecting
+    just to render a status badge.
+
+    `accounts` is the full list of managed accounts visible from this
+    connection (populated lazily on first `/broker/account` call); the
+    dashboard uses it to show an account dropdown when more than one
+    account is reachable.
+    """
+    b = _state.broker()
+    if b is None:
+        return {
+            "connected": False,
+            "paper": None,
+            "accounts": [],
+            "default_account": None,
+            "hint": (
+                "IB broker is disabled. Unset IB_BROKER_DISABLED to enable, "
+                "or set IB_BROKER_HOST / IB_BROKER_PORT / IB_BROKER_CLIENT_ID."
+            ),
+        }
+    return {
+        "connected": True,
+        "paper": b.paper,
+        "account": b.account,                 # legacy alias for default_account
+        "default_account": b.default_account,
+        "accounts": b.accounts,
+        "hint": None,
+    }
+
+
+@app.get("/broker/account")
+def broker_account() -> dict[str, Any]:
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+    try:
+        return b.get_account().to_dict()
+    except Exception as exc:
+        log.exception("IB get_account failed")
+        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+
+
+@app.get("/broker/positions")
+def broker_positions() -> dict[str, Any]:
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+    try:
+        positions = b.get_positions()
+    except Exception as exc:
+        log.exception("IB get_positions failed")
+        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+    return {"positions": [p.to_dict() for p in positions]}
+
+
+@app.post("/broker/close-all")
+def broker_close_all() -> dict[str, Any]:
+    """Kill switch — submit market closes for every open position."""
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+    try:
+        result = b.close_all_positions(cancel_orders=True)
+    except Exception as exc:
+        log.exception("IB close_all_positions failed")
+        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+    log.warning(
+        "Kill switch fired — submitted=%d ok=%d failed=%d",
+        result["submitted"], result["ok"], result["failed"],
+    )
+    return result
+
+
+@app.post("/broker/orders")
+def broker_submit_order(req: OrderRequest) -> dict[str, Any]:
+    """Place a new order. Logs every attempt at INFO."""
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+
+    side = req.side.lower()
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    if req.qty <= 0:
+        raise HTTPException(status_code=400, detail="qty must be > 0")
+    symbol = req.symbol.strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    log.info(
+        "Submitting order: paper=%s account=%s %s %s qty=%s type=%s tif=%s "
+        "stop=%s score=%s peg_offset=%s cap_price=%s",
+        b.paper, req.account or b.default_account, side, symbol,
+        req.qty, req.type, req.time_in_force,
+        req.planned_stop, req.score_at_entry,
+        req.peg_offset, req.cap_price,
+    )
+    try:
+        order = b.submit_order(
+            symbol=symbol,
+            qty=req.qty,
+            side=side,
+            order_type=req.type,
+            time_in_force=req.time_in_force,
+            limit_price=req.limit_price,
+            client_order_id=req.client_order_id,
+            planned_stop=req.planned_stop,
+            score_at_entry=req.score_at_entry,
+            peg_offset=req.peg_offset,
+            cap_price=req.cap_price,
+            account=req.account,
+        )
+    except KillSwitchActive as exc:
+        raise HTTPException(
+            status_code=423,
+            detail=str(exc),
+            headers={"X-Risk-Locked": "daily_drawdown"},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        log.exception("IB submit_order failed")
+        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+    return order.to_dict()
+
+
+@app.delete("/broker/positions/{symbol}")
+def broker_close_position(
+    symbol: str,
+    percentage: float | None = None,
+    qty: float | None = None,
+    account: str | None = None,
+) -> dict[str, Any]:
+    """Close a single position fully or partially.
+
+    Pass `?percentage=50` for a 50% close, `?qty=5` for a 5-share close,
+    or neither for a full close. `?account=DUxxxxxx` to target a
+    non-default account.
+    """
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+
+    sym = symbol.strip().upper()
+    log.info(
+        "Close position: paper=%s account=%s symbol=%s qty=%s percentage=%s",
+        b.paper, account or b.default_account, sym, qty, percentage,
+    )
+    try:
+        order = b.close_position(sym, qty=qty, percentage=percentage, account=account)
+    except KillSwitchActive as exc:
+        raise HTTPException(
+            status_code=423,
+            detail=str(exc),
+            headers={"X-Risk-Locked": "daily_drawdown"},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        log.exception("IB close_position failed")
+        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+    return order.to_dict()
+
+
+@app.get("/broker/orders")
+def broker_get_orders(limit: int = 30, status: str = "all") -> dict[str, Any]:
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+    capped_limit = max(1, min(limit, 200))
+    try:
+        orders = b.get_orders(limit=capped_limit, status=status)
+    except Exception as exc:
+        log.exception("IB get_orders failed")
+        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+    return {"orders": [o.to_dict() for o in orders]}
+
+
+# ----------------------------------------------------------------------
+# Real-time stream + risk/journal endpoints
+# ----------------------------------------------------------------------
+
+# Server-side journal singleton — the broker writes here from its event
+# handlers; the read endpoints below open their own short-lived
+# connections so the journal stays usable even when the broker isn't.
+_JOURNAL_PATH = _CACHE_DIR / "journal.sqlite"
+_journal_lock = threading.Lock()
+_journal_singleton: Journal | None = None
+
+
+def _get_journal() -> Journal:
+    global _journal_singleton
+    with _journal_lock:
+        if _journal_singleton is None:
+            _journal_singleton = Journal(_JOURNAL_PATH)
+        return _journal_singleton
+
+
+_SSE_HEARTBEAT_SEC = 15.0
+
+
+@app.get("/broker/stream")
+async def broker_stream() -> StreamingResponse:
+    """Server-sent events: pushes account / position / order / fill /
+    risk deltas as ib_async events fire. The frontend subscribes on
+    mount and stops polling. Initial `event: snapshot` carries the
+    current cache so reconnecting clients don't need a separate REST
+    round-trip.
+    """
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+
+    # Force a connect so reqAccountUpdates is wired and events flow.
+    # `get_account` is idempotent — subsequent calls are cheap.
+    try:
+        await asyncio.to_thread(b.get_account)
+    except Exception as exc:
+        log.warning("Broker connect failed before SSE stream: %r", exc)
+
+    loop = asyncio.get_running_loop()
+    queue, sub_id = b.state.subscribe(loop)
+    snapshot = b.state.snapshot()
+
+    async def event_gen() -> AsyncIterator[str]:
+        try:
+            yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
+            while True:
+                try:
+                    ev = await asyncio.wait_for(
+                        queue.get(), timeout=_SSE_HEARTBEAT_SEC
+                    )
+                    yield f"data: {json.dumps(ev)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            b.state.unsubscribe(sub_id)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/broker/risk-status")
+def broker_risk_status() -> dict[str, Any]:
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+    return b.state.risk_status()
+
+
+@app.post("/broker/risk-reset")
+def broker_risk_reset() -> dict[str, Any]:
+    """Clear the daily-drawdown kill flag. Manual only — the trader has
+    to consciously re-arm before new orders are accepted.
+    """
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+    b.state.reset_kill()
+    log.warning("Risk kill switch manually reset")
+    return b.state.risk_status()
+
+
+@app.get("/broker/journal/trades")
+def broker_journal_trades(limit: int = 100) -> dict[str, Any]:
+    journal = _get_journal()
+    trades = journal.list_trades(limit=limit)
+    return {"trades": trades}
+
+
+@app.get("/broker/journal/stats")
+def broker_journal_stats() -> dict[str, Any]:
+    journal = _get_journal()
+    return journal.stats()

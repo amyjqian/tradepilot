@@ -42,7 +42,7 @@ function loadTradingViewScript(): Promise<void> {
 
 interface Props {
   ticker: string
-  height?: number
+  height?: number | 'fill'
 }
 
 export function TradingViewChart({ ticker, height = 460 }: Props) {
@@ -93,9 +93,11 @@ export function TradingViewChart({ ticker, height = 460 }: Props) {
     }
   }, [ticker])
 
+  const fill = height === 'fill'
+  const style = fill ? { height: '100%' } : { height }
   return (
     <div
-      style={{ height }}
+      style={style}
       className="w-full overflow-hidden rounded border border-neutral-200 dark:border-neutral-800"
     >
       <div ref={containerRef} className="h-full w-full" />
