@@ -24,7 +24,7 @@ log = logging.getLogger("run_backtest")
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Walk-forward backtest over scanner signals.")
-    ap.add_argument("--provider", choices=["yfinance", "synthetic", "ibkr", "ib"], default="synthetic")
+    ap.add_argument("--provider", choices=["polygon", "yfinance", "synthetic", "ibkr", "ib"], default="polygon")
     ap.add_argument("--tickers", type=str, default=None)
     ap.add_argument("--interval", type=str, default=None)
     ap.add_argument("--lookback", type=int, default=None)

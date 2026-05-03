@@ -21,7 +21,7 @@ const DEFAULT_LOOKBACK: Record<Interval, number> = {
 }
 
 export default function App() {
-  const [provider, setProvider] = useState<Provider>('synthetic')
+  const [provider, setProvider] = useState<Provider>('polygon')
   const [interval, setInterval] = useState<Interval>('1d')
   const [lookback, setLookback] = useState<number>(DEFAULT_LOOKBACK['1d'])
   const [selected, setSelected] = useState<ScanResult | null>(null)
@@ -134,7 +134,6 @@ export default function App() {
             <RightRail
               selected={selected}
               brokerStatus={status}
-              account={account}
               positions={positions}
               orders={orders}
               accounts={accounts}

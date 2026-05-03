@@ -1,7 +1,9 @@
+import { Panel, PanelGroup } from 'react-resizable-panels'
 import type { ScanResult } from '../types'
 import { fmtCurrency, fmtMultiplier, fmtNumber, fmtPct } from '../format'
 import { ScoreBreakdown } from './ScoreBreakdown'
 import { RealtimeChart } from './RealtimeChart'
+import { ResizeHandle } from './ResizeHandle'
 
 interface Props {
   selected: ScanResult | null
@@ -50,53 +52,61 @@ export function CenterPane({ selected }: Props) {
         </span>
       </header>
 
-      <div className="min-h-0 flex-[1.6]">
-        <RealtimeChart ticker={r.ticker} defaultInterval="1m" />
-      </div>
+      <PanelGroup
+        direction="vertical"
+        autoSaveId="tradepilot-centerpane"
+        className="min-h-0 flex-1"
+      >
+        <Panel defaultSize={62} minSize={20} className="min-h-0">
+          <RealtimeChart ticker={r.ticker} defaultInterval="1m" />
+        </Panel>
+        <ResizeHandle direction="vertical" />
+        <Panel defaultSize={38} minSize={10} className="min-h-0">
+          <div className="grid h-full min-h-0 gap-2 pt-2 lg:grid-cols-3">
+            <Card title="Quick stats">
+              <ul className="space-y-1 text-xs">
+                <Stat label="RSI" value={fmtNumber(r.rsi)} />
+                <Stat label="Rel Vol" value={fmtMultiplier(r.rel_volume)} />
+                <Stat
+                  label="Distance from 20d high"
+                  value={fmtPct(r.dist_from_20d_high_pct, true)}
+                />
+                <Stat
+                  label="Above VWAP"
+                  value={r.above_vwap ? 'Yes' : 'No'}
+                  good={r.above_vwap}
+                />
+                <Stat
+                  label="Above EMA9"
+                  value={r.above_ema9 ? 'Yes' : 'No'}
+                  good={r.above_ema9}
+                />
+                <Stat
+                  label="EMA stacked"
+                  value={r.ema_stacked ? 'Yes' : 'No'}
+                  good={r.ema_stacked}
+                />
+              </ul>
+            </Card>
 
-      <div className="grid min-h-0 flex-1 gap-2 lg:grid-cols-3">
-        <Card title="Quick stats">
-          <ul className="space-y-1 text-xs">
-            <Stat label="RSI" value={fmtNumber(r.rsi)} />
-            <Stat label="Rel Vol" value={fmtMultiplier(r.rel_volume)} />
-            <Stat
-              label="Distance from 20d high"
-              value={fmtPct(r.dist_from_20d_high_pct, true)}
-            />
-            <Stat
-              label="Above VWAP"
-              value={r.above_vwap ? 'Yes' : 'No'}
-              good={r.above_vwap}
-            />
-            <Stat
-              label="Above EMA9"
-              value={r.above_ema9 ? 'Yes' : 'No'}
-              good={r.above_ema9}
-            />
-            <Stat
-              label="EMA stacked"
-              value={r.ema_stacked ? 'Yes' : 'No'}
-              good={r.ema_stacked}
-            />
-          </ul>
-        </Card>
+            <Card title="Signal strengths">
+              <ScoreBreakdown signals={r.signals} />
+            </Card>
 
-        <Card title="Signal strengths">
-          <ScoreBreakdown signals={r.signals} />
-        </Card>
-
-        <Card title="Reasons">
-          {r.reasons.length === 0 ? (
-            <p className="text-xs text-neutral-500">No qualitative factors</p>
-          ) : (
-            <ul className="list-disc space-y-1 pl-4 text-xs">
-              {r.reasons.map((reason, i) => (
-                <li key={i}>{reason}</li>
-              ))}
-            </ul>
-          )}
-        </Card>
-      </div>
+            <Card title="Reasons">
+              {r.reasons.length === 0 ? (
+                <p className="text-xs text-neutral-500">No qualitative factors</p>
+              ) : (
+                <ul className="list-disc space-y-1 pl-4 text-xs">
+                  {r.reasons.map((reason, i) => (
+                    <li key={i}>{reason}</li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+          </div>
+        </Panel>
+      </PanelGroup>
     </section>
   )
 }

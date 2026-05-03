@@ -40,6 +40,13 @@ from scanner.sector_rotation import (
 
 log = logging.getLogger(__name__)
 
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+logging.getLogger("scanner.data.polygon_quotes").setLevel(logging.INFO)
+
 app = FastAPI(title="TradePilot API", version="0.1.0")
 
 app.add_middleware(
@@ -187,14 +194,14 @@ def _on_shutdown() -> None:
 
 
 class ScanRequest(BaseModel):
-    provider: str = Field(default="synthetic")
+    provider: str = Field(default="polygon")
     tickers: list[str] | None = None
     interval: str | None = None
     lookback_days: int | None = None
 
 
 class BacktestRequest(BaseModel):
-    provider: str = Field(default="synthetic")
+    provider: str = Field(default="polygon")
     tickers: list[str] | None = None
     interval: str | None = None
     lookback_days: int | None = None
@@ -204,7 +211,7 @@ class BacktestRequest(BaseModel):
 
 
 class SectorRotationRequest(BaseModel):
-    provider: str = Field(default="synthetic")
+    provider: str = Field(default="polygon")
     interval: str | None = None
     lookback_days: int | None = None
     top_n: int = Field(default=2, ge=1, le=5)
@@ -218,9 +225,12 @@ class OrderRequest(BaseModel):
     symbol: str
     qty: float
     side: str  # "buy" / "sell"
-    type: str = "market"  # "market" / "limit" / "pegprim"
+    type: str = "market"  # "market" / "limit" / "stop" / "pegprim" / "midprice"
     time_in_force: str = "day"
     limit_price: float | None = None
+    # Trigger price for plain stop orders (type == "stop"). Stops trigger
+    # at this level and transmit as a market order.
+    stop_price: float | None = None
     client_order_id: str | None = None
     # Captured at submit time so the journal can compute R-multiple and
     # tag the trade with the entry score. Both optional — orders placed
@@ -613,9 +623,10 @@ def broker_submit_order(req: OrderRequest) -> dict[str, Any]:
 
     log.info(
         "Submitting order: paper=%s account=%s %s %s qty=%s type=%s tif=%s "
-        "stop=%s score=%s peg_offset=%s cap_price=%s",
+        "limit=%s stop=%s planned_stop=%s score=%s peg_offset=%s cap_price=%s",
         b.paper, req.account or b.default_account, side, symbol,
         req.qty, req.type, req.time_in_force,
+        req.limit_price, req.stop_price,
         req.planned_stop, req.score_at_entry,
         req.peg_offset, req.cap_price,
     )
@@ -627,6 +638,7 @@ def broker_submit_order(req: OrderRequest) -> dict[str, Any]:
             order_type=req.type,
             time_in_force=req.time_in_force,
             limit_price=req.limit_price,
+            stop_price=req.stop_price,
             client_order_id=req.client_order_id,
             planned_stop=req.planned_stop,
             score_at_entry=req.score_at_entry,
@@ -684,6 +696,26 @@ def broker_close_position(
         log.exception("IB close_position failed")
         raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
     return order.to_dict()
+
+
+@app.delete("/broker/orders")
+def broker_cancel_orders(symbol: str) -> dict[str, Any]:
+    """Cancel every still-working order for one symbol. Used by the
+    dashboard's per-ticker "Cancel" button. Pass `?symbol=AAPL`."""
+    b = _state.broker()
+    if b is None:
+        raise HTTPException(status_code=503, detail="Broker not configured")
+    sym = symbol.strip().upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    log.info("Cancel orders for symbol: %s", sym)
+    try:
+        return b.cancel_orders_for_symbol(sym)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        log.exception("IB cancel_orders_for_symbol failed")
+        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
 
 
 @app.get("/broker/orders")

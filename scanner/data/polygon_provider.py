@@ -53,6 +53,7 @@ log = logging.getLogger(__name__)
 # Map our canonical interval strings to Polygon's (multiplier, timespan).
 _INTERVAL_TO_AGG: dict[str, tuple[int, str]] = {
     "1m": (1, "minute"),
+    "2m": (2, "minute"),
     "5m": (5, "minute"),
     "15m": (15, "minute"),
     "1h": (1, "hour"),

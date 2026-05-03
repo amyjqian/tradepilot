@@ -669,6 +669,7 @@ class IBBroker:
         order_type: str = "market",
         time_in_force: str = "day",
         limit_price: float | None = None,
+        stop_price: float | None = None,
         client_order_id: str | None = None,  # noqa: ARG002 — IB has no equivalent
         planned_stop: float | None = None,
         score_at_entry: float | None = None,
@@ -689,6 +690,7 @@ class IBBroker:
                 order_type=order_type,
                 time_in_force=time_in_force,
                 limit_price=limit_price,
+                stop_price=stop_price,
                 planned_stop=planned_stop,
                 score_at_entry=score_at_entry,
                 peg_offset=peg_offset,
@@ -696,6 +698,12 @@ class IBBroker:
                 account=account,
             )
         )
+
+    def cancel_orders_for_symbol(self, symbol: str) -> dict[str, Any]:
+        """Cancel every still-working order for this symbol on the
+        connected account. Returns the count + ids canceled. Used by
+        the dashboard's per-symbol "Cancel" button."""
+        return self._submit(self._async_cancel_orders_for_symbol(symbol))
 
     def close_position(
         self,
@@ -829,6 +837,7 @@ class IBBroker:
         order_type: str,
         time_in_force: str,
         limit_price: float | None,
+        stop_price: float | None = None,
         planned_stop: float | None = None,
         score_at_entry: float | None = None,
         peg_offset: float | None = None,
@@ -837,7 +846,7 @@ class IBBroker:
     ) -> OrderRecord:
         ib = await self._async_connect()
         target_account = self._resolve_account(account)
-        from ib_async import LimitOrder, MarketOrder, Order, Stock
+        from ib_async import LimitOrder, MarketOrder, Order, Stock, StopOrder
 
         action = side.upper()
         if action not in ("BUY", "SELL"):
@@ -853,13 +862,21 @@ class IBBroker:
             if limit_price is None or limit_price <= 0:
                 raise ValueError("limit_price required for limit orders")
             order = LimitOrder(action, qty, limit_price)
+        elif kind == "stop":
+            # Plain stop: triggers at `stop_price`, then transmits as a
+            # market order. Used by the dashboard's "Stop Loss" button.
+            if stop_price is None or stop_price <= 0:
+                raise ValueError("stop_price (>0) required for stop orders")
+            order = StopOrder(action, qty, float(stop_price))
         elif kind in ("pegprim", "peg_prim", "rel"):
             # IB Pegged-to-Primary (REL): the working price tracks the
             # primary exchange's best bid (BUY) or ask (SELL) plus/minus
             # `auxPrice` (the offset). `lmtPrice` is a hard cap (BUY) or
             # floor (SELL) so a runaway tape can't blow past your tolerance.
-            if peg_offset is None or peg_offset <= 0:
-                raise ValueError("peg_offset (>0) required for pegprim orders")
+            # `peg_offset == 0` is allowed: that pegs the order exactly at
+            # the bid (BUY) / ask (SELL) — i.e. joins the queue passively.
+            if peg_offset is None or peg_offset < 0:
+                raise ValueError("peg_offset (>=0) required for pegprim orders")
             if cap_price is None or cap_price <= 0:
                 raise ValueError("cap_price (>0) required for pegprim orders")
             order = Order()
@@ -867,6 +884,18 @@ class IBBroker:
             order.totalQuantity = qty
             order.orderType = "REL"
             order.auxPrice = float(peg_offset)
+            order.lmtPrice = float(cap_price)
+        elif kind in ("midprice", "mid"):
+            # IB MIDPRICE: matches at the NBBO midpoint when crossable,
+            # else rests as a marketable limit. `cap_price` is the worst
+            # acceptable price (max for BUY, min for SELL) and is required
+            # by IB. Best-effort fill at midpoint, no worse than cap.
+            if cap_price is None or cap_price <= 0:
+                raise ValueError("cap_price (>0) required for midprice orders")
+            order = Order()
+            order.action = action
+            order.totalQuantity = qty
+            order.orderType = "MIDPRICE"
             order.lmtPrice = float(cap_price)
         else:
             raise ValueError(f"Unsupported order_type: {order_type!r}")
@@ -986,6 +1015,36 @@ class IBBroker:
             "failed": failed,
             "details": details,
         }
+
+    async def _async_cancel_orders_for_symbol(
+        self, symbol: str
+    ) -> dict[str, Any]:
+        ib = await self._async_connect()
+        sym = symbol.strip().upper()
+        if not sym:
+            raise ValueError("symbol required")
+        # Refresh so anything submitted via TWS is visible here too.
+        try:
+            await ib.reqAllOpenOrdersAsync()
+        except Exception:
+            log.debug("reqAllOpenOrdersAsync failed (non-fatal)", exc_info=True)
+        # `openTrades()` filters to ones the broker still considers
+        # working. Status check is belt-and-suspenders for stragglers.
+        terminal = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+        canceled: list[int] = []
+        for trade in list(ib.openTrades() or []):
+            if str(getattr(trade.contract, "symbol", "")).upper() != sym:
+                continue
+            if trade.orderStatus.status in terminal:
+                continue
+            try:
+                ib.cancelOrder(trade.order)
+                oid = int(getattr(trade.order, "orderId", 0) or 0)
+                if oid:
+                    canceled.append(oid)
+            except Exception:
+                log.exception("cancelOrder failed for %s order=%r", sym, trade.order)
+        return {"symbol": sym, "canceled": len(canceled), "order_ids": canceled}
 
     async def _async_get_orders(
         self, *, limit: int, status: str

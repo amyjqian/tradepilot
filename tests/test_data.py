@@ -243,6 +243,48 @@ def test_cached_provider_falls_back_to_stale_cache_on_pacing(tmp_path) -> None:
         wrapped2.get_bars_batch(["NEW"], "1d", 5)
 
 
+def test_cached_provider_backfills_when_lookback_grows(tmp_path) -> None:
+    """Cache reaching back only N days must trigger a full fetch when
+    a later request asks for a window that extends earlier than the
+    cache covers — not a small right-edge delta that would silently
+    serve a truncated frame."""
+    cache = BarCache(tmp_path / "cache")
+    end = pd.Timestamp.now(tz="UTC").normalize()
+    # Prime cache with 10 daily bars (only ~10 days of coverage).
+    short_idx = pd.date_range(end=end, periods=10, freq="D", tz="UTC")
+    short = pd.DataFrame(
+        {c: np.arange(10, dtype=float) for c in ("open", "high", "low", "close", "volume")},
+        index=short_idx,
+    )
+    cache.put("AAPL", "1d", short)
+
+    # Stub returns whatever lookback it was asked for, so we can assert
+    # on the requested window size without depending on SyntheticProvider.
+    captured: dict[str, int] = {}
+
+    class _StubProvider(MarketDataProvider):
+        def get_bars(self, ticker, interval, lookback_days):
+            captured["lookback"] = lookback_days
+            idx = pd.date_range(end=end, periods=lookback_days, freq="D", tz="UTC")
+            return pd.DataFrame(
+                {c: np.ones(lookback_days, dtype=float)
+                 for c in ("open", "high", "low", "close", "volume")},
+                index=idx,
+            )
+        def get_bars_batch(self, tickers, interval, lookback_days):
+            return {t: self.get_bars(t, interval, lookback_days) for t in tickers}
+
+    wrapped = CachedProvider(_StubProvider(), cache)
+
+    # Ask for 90 days — the cache only has 10. Must do a full 90-day
+    # fetch, not a 1-day delta keyed off the cache's last bar.
+    wrapped.get_bars("AAPL", "1d", 90)
+    assert captured.get("lookback") == 90, (
+        f"expected full 90-day fetch to backfill the left edge, "
+        f"got lookback={captured.get('lookback')}"
+    )
+
+
 def test_cached_provider_batch(tmp_path) -> None:
     now = datetime.now(UTC)
     wrapped = CachedProvider(SyntheticProvider(end=now), BarCache(tmp_path / "cache"))

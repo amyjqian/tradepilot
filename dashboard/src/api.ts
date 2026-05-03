@@ -177,6 +177,20 @@ export async function closePosition(
   return res.json() as Promise<OrderRecord>
 }
 
+export async function cancelOrdersForSymbol(
+  symbol: string,
+): Promise<{ symbol: string; canceled: number; order_ids: number[] }> {
+  const res = await fetch(
+    `${BASE_URL}/broker/orders?symbol=${encodeURIComponent(symbol)}`,
+    { method: 'DELETE' },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`cancel orders failed: ${res.status} ${text}`)
+  }
+  return res.json() as Promise<{ symbol: string; canceled: number; order_ids: number[] }>
+}
+
 export async function fetchOrders(limit = 30): Promise<OrderRecord[]> {
   const res = await fetch(`${BASE_URL}/broker/orders?limit=${limit}`)
   if (!res.ok) {

@@ -14,12 +14,35 @@ fi
 DOTENV="$(dirname "$0")/.env"
 
 free_port() {
+    # Kill anything bound to $1 and don't return until the port is free.
+    # SIGTERM first so the child can flush logs / close sockets cleanly;
+    # if it's still bound after a second we escalate to SIGKILL. Without
+    # this, `kill` returns instantly but the kernel may still hold the
+    # listening socket when uvicorn/vite tries to bind right after,
+    # producing "Address already in use" on a fresh `./run.sh up`.
     local port="$1"
-    if lsof -ti ":${port}" >/dev/null 2>&1; then
-        echo "Stopping existing process on :${port}…"
-        kill "$(lsof -ti ":${port}")" 2>/dev/null || true
-        sleep 1
+    local pids
+    pids="$(lsof -ti ":${port}" 2>/dev/null || true)"
+    if [[ -z "${pids}" ]]; then
+        return
     fi
+    echo "Stopping existing process on :${port} (pids: ${pids//$'\n'/ })…"
+    # shellcheck disable=SC2086
+    kill ${pids} 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        sleep 0.3
+        pids="$(lsof -ti ":${port}" 2>/dev/null || true)"
+        [[ -z "${pids}" ]] && return
+    done
+    echo "Port :${port} still held — sending SIGKILL."
+    # shellcheck disable=SC2086
+    kill -9 ${pids} 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        sleep 0.3
+        pids="$(lsof -ti ":${port}" 2>/dev/null || true)"
+        [[ -z "${pids}" ]] && return
+    done
+    echo "WARNING: port :${port} still in use after SIGKILL; bind will likely fail." >&2
 }
 
 source_dotenv() {
@@ -43,6 +66,7 @@ start_api() {
 start_up() {
     # Bring API + dashboard up together. Ctrl-C in this terminal stops both.
     free_port 8787
+    free_port 5173
     source_dotenv
 
     echo "Starting API on :8787…"
@@ -61,7 +85,10 @@ start_up() {
     # Brief pause so uvicorn's startup logs land before vite's.
     sleep 1
     echo "Starting dashboard on :5173…"
-    cd dashboard && npm run dev
+    # --strictPort: fail loud if 5173 is taken instead of silently
+    # drifting to 5174 (which would orphan bookmarks pointing at :5173).
+    # Anything that was on the port has already been killed by free_port.
+    cd dashboard && npm run dev -- --port 5173 --strictPort
 }
 
 case "$1" in
@@ -70,7 +97,7 @@ case "$1" in
   tune)              python scripts/run_tuning.py "${@:2}" ;;
   refresh-holdings)  python scripts/refresh_sector_holdings.py ;;
   api)               start_api ;;
-  dash)              cd dashboard && npm run dev ;;
+  dash)              free_port 5173; cd dashboard && npm run dev -- --port 5173 --strictPort ;;
   up)                start_up ;;
   test)              pytest tests/ -v --cov=scanner --cov-report=term-missing ;;
   *)                 echo "Usage: ./run.sh {scan|backtest|tune|refresh-holdings|api|dash|up|test}"; exit 1 ;;

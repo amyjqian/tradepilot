@@ -167,9 +167,21 @@ class CachedProvider(MarketDataProvider):
         """
         if cached is None or cached.empty:
             return None, lookback_days  # full fetch
+
+        # Left-edge coverage: does the cache reach back to the requested
+        # window start? A pure bar-count check (`len(cached) >= lookback_days`)
+        # is misleading for intraday — a 30-day 5m window has ~2,300 bars,
+        # so the count test passes even when only 1 day is cached. We
+        # compare timestamps instead so a request whose lookback grew
+        # (e.g. 30d → 90d) gets the older portion backfilled rather than
+        # silently truncated to whatever the cache happened to hold.
+        wanted_start = now - pd.Timedelta(days=lookback_days)
+        if cached.index[0] > wanted_start:
+            return None, lookback_days  # full fetch — backfill left edge
+
         age = self._cache.age_sec(ticker, interval)
         fresh = age is not None and age < self._ttl(interval)
-        if fresh and len(cached) >= lookback_days:
+        if fresh:
             return cached, None
         last_ts = cached.index[-1]
         return None, _delta_lookback_days(last_ts, now)

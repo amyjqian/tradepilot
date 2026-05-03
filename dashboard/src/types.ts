@@ -156,9 +156,11 @@ export interface SubmitOrderRequest {
   symbol: string
   qty: number
   side: 'buy' | 'sell'
-  type?: 'market' | 'limit' | 'pegprim'
+  type?: 'market' | 'limit' | 'stop' | 'pegprim' | 'midprice'
   time_in_force?: 'day' | 'gtc'
   limit_price?: number
+  /** Trigger price for plain stop orders (type === 'stop'). */
+  stop_price?: number
   /** Planned stop captured for journal R-multiple math. */
   planned_stop?: number
   /** Scanner score at the moment of submission. */
