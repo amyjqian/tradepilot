@@ -1,6 +1,6 @@
-# Bullish Scanner
+# TradePilot
 
-A local, offline-capable bullish stock scanner for day traders — ranked candidates, walk-forward backtests, threshold tuning, and a live React dashboard. No broker connection; free data via yfinance and a deterministic synthetic provider for offline work.
+A local trading workstation for day traders — directional (long/short) scanner, walk-forward backtests, threshold tuning, IBKR broker integration with manual order entry (semi-auto and auto modes coming), and a live React dashboard. Free data via Polygon, yfinance, and a deterministic synthetic provider for offline work.
 
 ## Architecture
 

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { runSectorRotation } from '../api'
 import type { ScanResult, SectorRotationResponse } from '../types'
 import { fmtNumber, fmtPct } from '../format'
+import { useResultFilters } from '../useResultFilters'
+import { ResultFilters } from './ResultFilters'
 
 interface Props {
   provider: string
@@ -25,6 +27,7 @@ export function SectorRotationPanel({
   const [topN, setTopN] = useState<number>(2)
   /** ETF symbol the user clicked to drill into; `null` = pooled view of all top-N. */
   const [activeSector, setActiveSector] = useState<string | null>(null)
+  const filters = useResultFilters()
 
   const run = useCallback(async () => {
     onError(null)
@@ -55,13 +58,20 @@ export function SectorRotationPanel({
   const topSet = new Set(data?.top_etfs ?? [])
 
   /** Filter the pooled results to the user-selected sector, or show
-   * everything when nothing is selected. */
-  const visibleResults = useMemo(() => {
+   * everything when nothing is selected. Then apply the trend filter
+   * pills on top — the two filters compose: sector-narrow first, then
+   * trend-narrow. */
+  const sectorResults = useMemo(() => {
     if (!data) return []
     if (!activeSector) return data.results
     const allowed = new Set(data.top_constituents_by_sector[activeSector] ?? [])
     return data.results.filter((r) => allowed.has(r.ticker))
   }, [data, activeSector])
+
+  const visibleResults = useMemo(
+    () => filters.apply(sectorResults),
+    [sectorResults, filters],
+  )
 
   const headerLabel =
     data && data.top_etfs.length > 0
@@ -195,9 +205,13 @@ export function SectorRotationPanel({
           </div>
 
           <div className="flex flex-1 flex-col overflow-hidden">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-1">
               <div className="text-[10px] uppercase tracking-wide text-neutral-500">
-                Top stocks in {headerLabel} ({visibleResults.length})
+                Top stocks in {headerLabel} (
+                {filters.hasActive
+                  ? `${visibleResults.length} of ${sectorResults.length}`
+                  : visibleResults.length}
+                )
               </div>
               {activeSector && (
                 <button
@@ -210,10 +224,23 @@ export function SectorRotationPanel({
                 </button>
               )}
             </div>
+            <ResultFilters
+              state={filters.state}
+              hasActive={filters.hasActive}
+              toggleTrend={filters.toggleTrend}
+              toggleGreen={filters.toggleGreen}
+              toggleNearHigh={filters.toggleNearHigh}
+              setMinScore={filters.setMinScore}
+              setRsiMin={filters.setRsiMin}
+              setRsiMax={filters.setRsiMax}
+              onClear={filters.clear}
+            />
             <div className="flex-1 overflow-y-auto">
               {visibleResults.length === 0 ? (
                 <p className="py-2 text-xs text-neutral-500">
-                  No constituents passed filters.
+                  {filters.hasActive && sectorResults.length > 0
+                    ? `All ${sectorResults.length} hits filtered out — clear a pill to see them.`
+                    : 'No constituents passed filters.'}
                 </p>
               ) : (
                 <ul className="divide-y divide-neutral-900">

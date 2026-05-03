@@ -47,7 +47,7 @@ type StreamEvent =
       payload: { default_account: string | null; accounts: string[] }
     }
 
-const SELECTED_ACCOUNT_KEY = 'bullish.selected_account'
+const SELECTED_ACCOUNT_KEY = 'tradepilot.selected_account'
 
 const RECONNECT_DELAY_MS = 3_000
 

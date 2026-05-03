@@ -45,9 +45,9 @@ class ConsoleNotifier:
 
     def send(self, results: list[ScanResult]) -> None:
         if not results:
-            self._console.print("[yellow]No bullish candidates after filtering.[/yellow]")
+            self._console.print("[yellow]No candidates after filtering.[/yellow]")
             return
-        table = Table(title="Bullish Scan", box=SIMPLE_HEAVY, show_lines=False)
+        table = Table(title="Scan", box=SIMPLE_HEAVY, show_lines=False)
         table.add_column("Ticker", style="bold")
         table.add_column("Score", justify="right")
         table.add_column("Price", justify="right")
@@ -82,7 +82,7 @@ class _WebhookNotifier:
         return bool(self._url)
 
     def _payload_lines(self, results: list[ScanResult]) -> list[str]:
-        lines = ["*Bullish Scanner — top candidates*"]
+        lines = ["*TradePilot — top candidates*"]
         for r in results:
             reasons = ", ".join(_top_reasons(r)) or "—"
             lines.append(

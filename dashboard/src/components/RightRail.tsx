@@ -50,7 +50,7 @@ export function RightRail({
     <aside className="flex h-full flex-col border-l border-neutral-800 bg-neutral-950">
       <PanelGroup
         direction="vertical"
-        autoSaveId="bullish-rightrail"
+        autoSaveId="tradepilot-rightrail"
         className="h-full"
       >
         <Panel defaultSize={32} minSize={15} className="min-h-0">
@@ -87,7 +87,7 @@ export function RightRail({
                 <p className="text-[10px]">
                   Make sure TWS or IB Gateway is running and accepting API connections,
                   then set <code className="rounded bg-neutral-800 px-1">IB_BROKER_PORT</code>{' '}
-                  in <code>~/.config/bullish_scanner/ib.env</code> and restart the API.
+                  in <code>.env</code> and restart the API.
                 </p>
               </div>
             ) : positions.length === 0 ? (

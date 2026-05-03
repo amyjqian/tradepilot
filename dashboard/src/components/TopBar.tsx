@@ -80,7 +80,7 @@ export function TopBar({
     <header className="border-b border-neutral-800 bg-neutral-950 px-4 py-2 text-neutral-100">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <h1 className="text-sm font-semibold tracking-tight">Bullish Scanner</h1>
+          <h1 className="text-sm font-semibold tracking-tight">TradePilot</h1>
           <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] uppercase text-neutral-400">
             phase 3
           </span>

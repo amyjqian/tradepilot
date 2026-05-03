@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { fetchWatchlist, runScan, saveWatchlist } from '../api'
 import type { ScanResponse, ScanResult } from '../types'
 import { fmtNumber, fmtPct } from '../format'
+import { useResultFilters } from '../useResultFilters'
+import { ResultFilters } from './ResultFilters'
 
 interface Props {
   provider: string
@@ -25,6 +27,7 @@ export function WatchlistPanel({
   const [draft, setDraft] = useState('')
   const [scan, setScan] = useState<ScanResponse | null>(null)
   const [loading, setLoading] = useState(false)
+  const filters = useResultFilters()
 
   useEffect(() => {
     fetchWatchlist()
@@ -112,25 +115,56 @@ export function WatchlistPanel({
 
       {scan && (
         <div className="flex flex-1 flex-col overflow-hidden">
-          <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-neutral-500">
-            <span>Top picks ({scan.results.length})</span>
+          <div className="flex flex-wrap items-center justify-between gap-1 text-[10px] uppercase tracking-wide text-neutral-500">
+            <span>
+              Top picks (
+              {filters.hasActive
+                ? `${filters.apply(scan.results).length} of ${scan.results.length}`
+                : scan.results.length}
+              )
+            </span>
             <span>{scan.n_candidates_scanned} scanned</span>
           </div>
+          <ResultFilters
+            state={filters.state}
+            hasActive={filters.hasActive}
+            toggleTrend={filters.toggleTrend}
+            toggleGreen={filters.toggleGreen}
+            toggleNearHigh={filters.toggleNearHigh}
+            setMinScore={filters.setMinScore}
+            setRsiMin={filters.setRsiMin}
+            setRsiMax={filters.setRsiMax}
+            onClear={filters.clear}
+          />
           <div className="flex-1 overflow-y-auto">
-            {scan.results.length === 0 ? (
-              <p className="py-2 text-xs text-neutral-500">No tickers passed filters.</p>
-            ) : (
-              <ul className="divide-y divide-neutral-900">
-                {scan.results.map((r) => (
-                  <ScannerRow
-                    key={r.ticker}
-                    result={r}
-                    isSelected={selected === r.ticker}
-                    onClick={() => onSelect(r)}
-                  />
-                ))}
-              </ul>
-            )}
+            {(() => {
+              const visible = filters.apply(scan.results)
+              if (scan.results.length === 0)
+                return (
+                  <p className="py-2 text-xs text-neutral-500">
+                    No tickers passed filters.
+                  </p>
+                )
+              if (visible.length === 0)
+                return (
+                  <p className="py-2 text-xs text-neutral-500">
+                    All {scan.results.length} hits filtered out — clear a pill to
+                    see them.
+                  </p>
+                )
+              return (
+                <ul className="divide-y divide-neutral-900">
+                  {visible.map((r) => (
+                    <ScannerRow
+                      key={r.ticker}
+                      result={r}
+                      isSelected={selected === r.ticker}
+                      onClick={() => onSelect(r)}
+                    />
+                  ))}
+                </ul>
+              )
+            })()}
           </div>
         </div>
       )}

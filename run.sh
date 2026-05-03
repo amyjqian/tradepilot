@@ -7,9 +7,11 @@ if [[ -z "${VIRTUAL_ENV:-}" && -f ".venv/bin/activate" ]]; then
     source .venv/bin/activate
 fi
 
-# Kept outside the repo on purpose. Sourced before `api` / `up` so the IB
-# broker connection settings reach uvicorn without retyping each session.
-IB_ENV="${HOME}/.config/bullish_scanner/ib.env"
+# Repo-local env file (gitignored). Sourced before `api` / `up` so IB broker
+# and Polygon settings reach uvicorn without retyping each session. Python
+# entry points also auto-load this via scanner/__init__.py — sourcing here
+# additionally makes the values visible to the shell and child npm processes.
+DOTENV="$(dirname "$0")/.env"
 
 free_port() {
     local port="$1"
@@ -20,26 +22,28 @@ free_port() {
     fi
 }
 
-source_ib_env() {
-    if [[ -f "${IB_ENV}" ]]; then
+source_dotenv() {
+    if [[ -f "${DOTENV}" ]]; then
+        set -a
         # shellcheck disable=SC1090
-        source "${IB_ENV}"
-        echo "Loaded IB env from ${IB_ENV}"
+        source "${DOTENV}"
+        set +a
+        echo "Loaded env from ${DOTENV}"
     else
-        echo "No ${IB_ENV} — broker will use default IB_BROKER_* settings."
+        echo "No ${DOTENV} — broker/data providers will use defaults."
     fi
 }
 
 start_api() {
     free_port 8787
-    source_ib_env
+    source_dotenv
     exec uvicorn api.server:app --reload --port 8787
 }
 
 start_up() {
     # Bring API + dashboard up together. Ctrl-C in this terminal stops both.
     free_port 8787
-    source_ib_env
+    source_dotenv
 
     echo "Starting API on :8787…"
     uvicorn api.server:app --reload --port 8787 &

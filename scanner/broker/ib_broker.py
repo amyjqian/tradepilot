@@ -45,6 +45,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -251,6 +252,12 @@ class IBBroker:
         # Latest values per IB account-summary tag — accumulated as
         # accountValueEvent fires so we can emit consolidated snapshots.
         self._account_tags: dict[str, str] = {}
+        # Fail-fast cache: when a TCP probe to TWS fails, remember the
+        # error for a short window so dashboard polls don't each pay the
+        # ib_async handshake timeout (~10s) and exhaust the FastAPI thread
+        # pool.
+        self._unreachable_until: float = 0.0
+        self._unreachable_msg: str | None = None
 
         if journal is None:
             jp = self._cfg.journal_path or (
@@ -304,6 +311,39 @@ class IBBroker:
     # Connect / disconnect
     # ------------------------------------------------------------------
 
+    async def _probe_reachable(self) -> None:
+        """Cheap TCP probe before the full ib_async handshake.
+
+        connectAsync's default timeout is 10s; without this guard, if TWS
+        is down, dashboard polls of /broker/* each block a FastAPI thread
+        for 10s and quickly exhaust the (default ~40-thread) pool —
+        wedging *every* endpoint, including unrelated ones like /scan.
+        A failed TCP connect resolves in ~ms; cache the negative for 2s
+        so a burst of polls only probes the port once.
+        """
+        now = time.monotonic()
+        if now < self._unreachable_until and self._unreachable_msg:
+            raise ConnectionError(self._unreachable_msg)
+        try:
+            fut = asyncio.open_connection(self._cfg.host, self._cfg.port)
+            _, writer = await asyncio.wait_for(fut, timeout=0.5)
+        except Exception as exc:
+            msg = (
+                f"TWS/IB Gateway not reachable at {self._cfg.host}:"
+                f"{self._cfg.port} ({exc.__class__.__name__}). "
+                f"Start TWS or set IB_BROKER_PORT to a listening port."
+            )
+            self._unreachable_msg = msg
+            self._unreachable_until = now + 2.0
+            raise ConnectionError(msg) from exc
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        self._unreachable_msg = None
+        self._unreachable_until = 0.0
+
     async def _async_connect(self) -> Any:
         import ib_async
 
@@ -311,6 +351,8 @@ class IBBroker:
             return self._ib
         self._ib = None
         self._events_wired = False
+
+        await self._probe_reachable()
 
         ib: Any = ib_async.IB()
         log.info(

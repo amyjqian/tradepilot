@@ -32,6 +32,7 @@ Env:
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import threading
@@ -78,6 +79,11 @@ class PolygonConfig:
     rate_limit_per_min: int = 5
     request_timeout_sec: float = 20.0
     max_retries: int = 3
+    # Parallel HTTP fan-out for `get_bars_batch`. Default 16 keeps a
+    # 280-ticker sector-rotation pull around ~5s while staying well under
+    # both Polygon's per-minute budget and httpx.Client's default 100-conn
+    # pool. Drop to 1 to force sequential (e.g. when debugging).
+    max_concurrency: int = 16
 
     @classmethod
     def from_env(cls) -> PolygonConfig:
@@ -91,6 +97,7 @@ class PolygonConfig:
             api_key=key,
             base_url=os.environ.get("POLYGON_API_BASE", "https://api.polygon.io"),
             rate_limit_per_min=int(os.environ.get("POLYGON_RATE_LIMIT_PER_MIN", "5")),
+            max_concurrency=max(1, int(os.environ.get("POLYGON_MAX_CONCURRENCY", "16"))),
         )
 
 
@@ -210,18 +217,46 @@ class PolygonProvider(MarketDataProvider):
     def get_bars_batch(
         self, tickers: list[str], interval: str, lookback_days: int
     ) -> dict[str, pd.DataFrame]:
+        if not tickers:
+            return {}
         out: dict[str, pd.DataFrame] = {}
-        for ticker in tickers:
+        workers = min(self._cfg.max_concurrency, len(tickers))
+        if workers <= 1:
+            for ticker in tickers:
+                try:
+                    out[ticker] = self.get_bars(ticker, interval, lookback_days)
+                except (PolygonAuthError, PolygonRateLimited):
+                    raise
+                except Exception as exc:
+                    log.warning("Polygon get_bars failed for %s: %s", ticker, exc)
+            return out
+
+        # Parallel fan-out: httpx.Client is thread-safe and the rate
+        # limiter coordinates across threads, so we just fire workers in
+        # parallel. Auth/rate errors short-circuit the whole batch — they
+        # won't fix themselves between tickers.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="polygon-batch",
+        ) as ex:
+            futures = {
+                ex.submit(self.get_bars, t, interval, lookback_days): t
+                for t in tickers
+            }
             try:
-                out[ticker] = self.get_bars(ticker, interval, lookback_days)
-            except PolygonAuthError:
-                # Auth errors aren't going to fix themselves between
-                # tickers; bail out of the batch.
+                for fut in concurrent.futures.as_completed(futures):
+                    t = futures[fut]
+                    try:
+                        out[t] = fut.result()
+                    except (PolygonAuthError, PolygonRateLimited):
+                        raise
+                    except Exception as exc:
+                        log.warning("Polygon get_bars failed for %s: %s", t, exc)
+            except (PolygonAuthError, PolygonRateLimited):
+                # Cancel queued futures so the executor's shutdown only
+                # waits on the ~workers in-flight requests.
+                for f in futures:
+                    f.cancel()
                 raise
-            except PolygonRateLimited:
-                raise
-            except Exception as exc:
-                log.warning("Polygon get_bars failed for %s: %s", ticker, exc)
         return out
 
     # ------------------------------------------------------------------

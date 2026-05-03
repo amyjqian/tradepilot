@@ -1,7 +1,7 @@
 [project]
-name = "bullish_scanner"
+name = "tradepilot"
 version = "0.1.0"
-description = "Bullish stock scanner + backtester + dashboard for day traders."
+description = "TradePilot — directional stock scanner, backtester, broker integration, and dashboard for day traders."
 requires-python = ">=3.11"
 
 [tool.ruff]

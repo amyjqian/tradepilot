@@ -10,6 +10,7 @@ wrapped provider, saving IB pacing budget.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ from scanner.sector_rotation import (
 
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="Bullish Scanner API", version="0.1.0")
+app = FastAPI(title="TradePilot API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,6 +68,8 @@ class _State:
         self._providers_lock = threading.Lock()
         self._broker: IBBroker | None | _Sentinel = _UNSET
         self._broker_lock = threading.Lock()
+        self._quote_streamer: Any = None
+        self._quote_streamer_lock = threading.Lock()
 
     def broker(self) -> IBBroker | None:
         """Return the configured broker, or None if intentionally disabled.
@@ -83,6 +86,20 @@ class _State:
     def reset_broker(self) -> None:
         with self._broker_lock:
             self._broker = _UNSET
+
+    def quote_streamer(self) -> Any:
+        """Lazy singleton for the Polygon WebSocket quote streamer. The
+        background loop is started on first use and shared across SSE
+        clients so we never open more than one upstream connection.
+        Raises RuntimeError if POLYGON_API_KEY is not configured.
+        """
+        with self._quote_streamer_lock:
+            if self._quote_streamer is None:
+                from scanner.data.polygon_quotes import PolygonQuoteStreamer
+                s = PolygonQuoteStreamer.from_env()
+                s.start()
+                self._quote_streamer = s
+            return self._quote_streamer
 
     def cache_get(self, key: str) -> dict[str, Any] | None:
         with self._cache_lock:
@@ -134,6 +151,15 @@ class _State:
                     disc()
                 except Exception:
                     log.exception("Broker disconnect failed")
+        # Stop the Polygon WebSocket loop too.
+        with self._quote_streamer_lock:
+            streamer = self._quote_streamer
+            self._quote_streamer = None
+        if streamer is not None:
+            try:
+                streamer.stop()
+            except Exception:
+                log.exception("Quote streamer stop failed")
 
 
 class _Sentinel:
@@ -288,11 +314,33 @@ def _resolve_cfg(overrides: ScanRequest | BacktestRequest) -> ScannerConfig:
     return cfg
 
 
+def _config_fingerprint(cfg: ScannerConfig) -> str:
+    """Short, stable hash of the scoring-relevant config fields. Used in
+    the /scan cache key so threshold/weight changes invalidate cached
+    results — without this a `POST /config` followed by `/scan` returns
+    a result computed under the previous config for up to the cache TTL.
+    """
+    payload = cfg.model_dump(
+        mode="json",
+        # `default_tickers` is already in the cache key as the resolved
+        # symbol list; `interval` and `lookback_days` are too. Including
+        # them here would just bloat the hash without changing keys.
+        exclude={"default_tickers", "interval", "lookback_days"},
+    )
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True).encode()
+    ).hexdigest()[:10]
+
+
 @app.post("/scan")
 def post_scan(req: ScanRequest) -> dict[str, Any]:
     cfg = _resolve_cfg(req)
     tickers = [t.upper() for t in req.tickers] if req.tickers else list(cfg.default_tickers)
-    cache_key = f"{req.provider}|{cfg.interval}|{cfg.lookback_days}|{','.join(sorted(tickers))}"
+    cfg_fp = _config_fingerprint(cfg)
+    cache_key = (
+        f"{req.provider}|{cfg.interval}|{cfg.lookback_days}|"
+        f"{','.join(sorted(tickers))}|cfg={cfg_fp}"
+    )
 
     cached = _state.cache_get(cache_key)
     if cached is not None:
@@ -754,3 +802,210 @@ def broker_journal_trades(limit: int = 100) -> dict[str, Any]:
 def broker_journal_stats() -> dict[str, Any]:
     journal = _get_journal()
     return journal.stats()
+
+
+# ----------------------------------------------------------------------
+# Real-time quotes — Polygon WebSocket → SSE multiplexer
+# ----------------------------------------------------------------------
+
+
+def _polygon_event_to_payload(ev: dict[str, Any]) -> dict[str, Any] | None:
+    """Translate a Polygon WS event into the chart-shaped payload the
+    dashboard's RealtimeChart expects.
+
+    `AM` (minute aggregate) → `bar` event (drives the candlestick).
+    `T`  (trade)            → `trade` event (drives the live price line
+                              and the toolbar pill — sub-second cadence).
+
+    Returns None for events we don't handle so the caller can skip the
+    SSE frame entirely.
+    """
+    kind = str(ev.get("ev") or "")
+    if kind == "AM":
+        # Polygon timestamps are millisecond epoch; lightweight-charts
+        # wants epoch seconds for intraday data.
+        start_ms = int(ev.get("s") or 0)
+        return {
+            "kind": "bar",
+            "payload": {
+                "time": start_ms // 1000,
+                "open": ev.get("o"),
+                "high": ev.get("h"),
+                "low": ev.get("l"),
+                "close": ev.get("c"),
+                "volume": ev.get("v"),
+                "vwap": ev.get("vw"),
+            },
+        }
+    if kind == "T":
+        ts_ms = int(ev.get("t") or 0)
+        price = ev.get("p")
+        if price is None:
+            return None
+        return {
+            "kind": "trade",
+            "payload": {
+                "price": float(price),
+                "size": float(ev.get("s") or 0),
+                "ts": ts_ms // 1000,
+            },
+        }
+    return None
+
+
+_QUOTES_HEARTBEAT_SEC = 15.0
+# Server-side throttle for `T` (trade) events. Polygon emits
+# 50-500 prints/sec on liquid names — way more than a chart needs and
+# more than an SSE pipe wants to relay. We drop intermediate trades
+# and forward at most ~10/sec per SSE client; the most recent print
+# always lands within ~100 ms of arrival, which is well under any
+# perceptible latency.
+_TRADE_THROTTLE_SEC = 0.1
+
+
+@app.get("/quotes/stream/{symbol}")
+async def quotes_stream(symbol: str) -> StreamingResponse:
+    """Server-sent events: real-time minute aggregates for a symbol.
+
+    The first SSE client for a symbol opens the upstream Polygon
+    subscription; later clients share it. When the last client drops,
+    we send `unsubscribe` to Polygon.
+
+    Free Polygon Stocks plans don't include WebSocket — auth will fail
+    in the streamer's reconnect loop and no bars will arrive. The
+    endpoint still returns 200 + heartbeats so the client can show
+    "no data flowing" rather than getting a 5xx.
+    """
+    sym = symbol.strip().upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+    try:
+        streamer = _state.quote_streamer()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=512)
+    last_trade_ts = [0.0]  # mutable cell for the throttle gate
+
+    def on_event(ev: dict[str, Any]) -> None:
+        # Polygon WS callbacks fire on the streamer's loop thread; hand
+        # off to the FastAPI loop the queue belongs to.
+        if ev.get("ev") == "T":
+            now = time.monotonic()
+            # Drop trades that arrive within the throttle window. The
+            # next trade after the cooldown gets through — so the chart
+            # sees a representative current price every ~100 ms during
+            # RTH, not every print (which can be 100+/sec).
+            if now - last_trade_ts[0] < _TRADE_THROTTLE_SEC:
+                return
+            last_trade_ts[0] = now
+        try:
+            loop.call_soon_threadsafe(_safe_put, queue, ev)
+        except RuntimeError:
+            pass
+
+    # Subscribe to both 1-minute aggregates and trade prints. AM drives
+    # the candle/volume update; T drives the live-price ticker and the
+    # ghost line. Plans without T entitlement see Polygon reject the T
+    # sub but accept AM, so the chart still works (just minute-cadence).
+    sub_id = streamer.subscribe(sym, channels=("AM", "T"), callback=on_event)
+
+    async def event_gen() -> AsyncIterator[str]:
+        try:
+            yield f"event: connected\ndata: {json.dumps({'symbol': sym})}\n\n"
+            while True:
+                try:
+                    ev = await asyncio.wait_for(
+                        queue.get(), timeout=_QUOTES_HEARTBEAT_SEC
+                    )
+                    payload = _polygon_event_to_payload(ev)
+                    if payload is None:
+                        continue
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            try:
+                streamer.unsubscribe(sub_id)
+            except Exception:
+                log.debug("quote unsubscribe raised", exc_info=True)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _safe_put(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
+    """Non-blocking enqueue with drop-oldest backpressure. Mirrors the
+    pattern in scanner.broker.state — slow consumers don't block the
+    upstream WS thread; we drop the oldest event instead.
+    """
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        try:
+            queue.get_nowait()
+            queue.put_nowait(event)
+        except Exception:
+            pass
+
+
+@app.get("/quotes/history/{symbol}")
+def quotes_history(
+    symbol: str,
+    interval: str = "1m",
+    lookback_days: int = 1,
+) -> dict[str, Any]:
+    """Initial chart bars from Polygon REST. The dashboard's
+    RealtimeChart calls this once on mount and then layers on the SSE
+    stream for updates. We always go through Polygon here — TradingView
+    rendered any provider before, but live updates only come from
+    Polygon, so the history must match.
+    """
+    sym = symbol.strip().upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+    capped_lookback = max(1, min(lookback_days, 365))
+    try:
+        provider = _state.provider("polygon")
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        df = provider.get_bars(sym, interval, capped_lookback)
+    except PacingBudgetExhausted as exc:
+        retry = max(1, int(round(exc.retry_after_sec)))
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(retry)},
+        ) from exc
+    except Exception as exc:
+        log.warning("quotes_history failed for %s: %s", sym, exc)
+        raise HTTPException(
+            status_code=502, detail=f"history fetch failed: {exc!r}"
+        ) from exc
+
+    bars: list[dict[str, Any]] = []
+    for idx, row in df.iterrows():
+        bars.append(
+            {
+                "time": int(idx.timestamp()),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row["volume"]),
+            }
+        )
+    return {
+        "symbol": sym,
+        "interval": interval,
+        "lookback_days": capped_lookback,
+        "bars": bars,
+    }

@@ -3,7 +3,7 @@ import { submitOrder } from '../api'
 import type { AccountSnapshot, ScanResult } from '../types'
 import { fmtCurrency, fmtNumber } from '../format'
 
-const RISK_PCT_KEY = 'bullish.risk_pct'
+const RISK_PCT_KEY = 'tradepilot.risk_pct'
 const DEFAULT_RISK_PCT = 0.5
 
 // Tick size for US stocks priced ≥ $1. Sub-dollar stocks technically use

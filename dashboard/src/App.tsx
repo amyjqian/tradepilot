@@ -112,7 +112,7 @@ export default function App() {
       <main className="min-h-0 flex-1">
         <PanelGroup
           direction="horizontal"
-          autoSaveId="bullish-mainsplit"
+          autoSaveId="tradepilot-mainsplit"
           className="h-full"
         >
           <Panel defaultSize={20} minSize={12} maxSize={40} className="min-w-0">

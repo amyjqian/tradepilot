@@ -1,7 +1,7 @@
 import type { ScanResult } from '../types'
 import { fmtCurrency, fmtMultiplier, fmtNumber, fmtPct } from '../format'
 import { ScoreBreakdown } from './ScoreBreakdown'
-import { TradingViewChart } from './TradingViewChart'
+import { RealtimeChart } from './RealtimeChart'
 
 interface Props {
   selected: ScanResult | null
@@ -51,7 +51,7 @@ export function CenterPane({ selected }: Props) {
       </header>
 
       <div className="min-h-0 flex-[1.6]">
-        <TradingViewChart ticker={r.ticker} height="fill" />
+        <RealtimeChart ticker={r.ticker} defaultInterval="1m" />
       </div>
 
       <div className="grid min-h-0 flex-1 gap-2 lg:grid-cols-3">

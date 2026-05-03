@@ -1,0 +1,41 @@
+{
+  "_comment": "Relaxed-gates 5m intraday preset. Same universe / weights / RSI band as intraday_5m, but the three trend hard-gates (require_above_vwap, require_above_ema9, require_ema9_above_ema20) are turned off — they become *scored inputs* (via the trend_alignment weight) rather than all-or-nothing filters. Use this when the strict preset returns zero candidates because the tape is consolidating or rotating; you'll see lower-conviction setups whose trend alignment is partial. Re-tighten the gates for live entries.",
+  "universe": {
+    "min_price": 5.0,
+    "max_price": 1000.0,
+    "min_avg_volume": 30000,
+    "min_dollar_volume": 2000000
+  },
+  "thresholds": {
+    "min_relative_volume": 1.0,
+    "min_gap_pct": 0.0,
+    "max_gap_pct": 15.0,
+    "rsi_min": 35.0,
+    "rsi_max": 80.0,
+    "breakout_proximity_pct": 1.0,
+    "require_above_vwap": false,
+    "require_above_ema9": false,
+    "require_ema9_above_ema20": false
+  },
+  "weights": {
+    "relative_volume": 0.30,
+    "momentum": 0.25,
+    "trend_alignment": 0.25,
+    "rsi_position": 0.05,
+    "breakout_proximity": 0.15
+  },
+  "default_tickers": [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA",
+    "AMD", "AVGO", "TSM", "MU", "QCOM", "INTC", "ARM", "MRVL",
+    "JPM", "BAC", "GS", "MS", "V", "MA", "AXP",
+    "WMT", "COST", "HD", "NKE", "MCD", "SBUX", "TGT",
+    "UNH", "JNJ", "LLY", "PFE", "ABBV",
+    "CAT", "BA", "DE", "GE", "HON", "UPS",
+    "XOM", "CVX", "COP",
+    "TSLA", "NFLX", "COIN", "PLTR", "SNOW", "SHOP", "UBER",
+    "HOOD", "SOFI", "CRWD", "PANW"
+  ],
+  "top_n_results": 25,
+  "interval": "5m",
+  "lookback_days": 5
+}
