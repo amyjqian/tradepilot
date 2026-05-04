@@ -6,6 +6,7 @@ import { BacktestPanel } from './BacktestPanel'
 import { JournalPanel } from './JournalPanel'
 
 type Tab = 'sector' | 'watchlist' | 'backtest' | 'journal'
+const TAB_KEY = 'tradepilot.left_tab'
 
 interface Props {
   provider: string
@@ -31,7 +32,16 @@ export function LeftRail({
   onSelect,
   onError,
 }: Props) {
-  const [tab, setTab] = useState<Tab>('sector')
+  const [tab, setTabState] = useState<Tab>(() => {
+    const saved = window.localStorage.getItem(TAB_KEY)
+    return saved === 'watchlist' || saved === 'backtest' || saved === 'journal'
+      ? (saved as Tab)
+      : 'sector'
+  })
+  const setTab = (t: Tab) => {
+    setTabState(t)
+    window.localStorage.setItem(TAB_KEY, t)
+  }
 
   return (
     <aside className="flex h-full flex-col border-r border-neutral-800 bg-neutral-950">
@@ -51,8 +61,14 @@ export function LeftRail({
           </button>
         ))}
       </nav>
+      {/* Render every tab and toggle visibility via `hidden` so each
+       * panel's state, scroll position, in-flight requests, and
+       * auto-rescan timers persist across tab switches. The cost is N
+       * mounted components instead of 1; for our four tabs that's
+       * negligible vs. the UX win of "ranks are still there when I come
+       * back to Sector Rotation a minute later." */}
       <div className="min-h-0 flex-1 overflow-hidden p-2">
-        {tab === 'sector' && (
+        <PanelHost active={tab === 'sector'}>
           <SectorRotationPanel
             provider={provider}
             interval={interval}
@@ -61,8 +77,8 @@ export function LeftRail({
             onSelect={onSelect}
             onError={onError}
           />
-        )}
-        {tab === 'watchlist' && (
+        </PanelHost>
+        <PanelHost active={tab === 'watchlist'}>
           <WatchlistPanel
             provider={provider}
             interval={interval}
@@ -71,12 +87,31 @@ export function LeftRail({
             onSelect={onSelect}
             onError={onError}
           />
-        )}
-        {tab === 'backtest' && (
+        </PanelHost>
+        <PanelHost active={tab === 'backtest'}>
           <BacktestPanel provider={provider} lookback={lookback} onError={onError} />
-        )}
-        {tab === 'journal' && <JournalPanel />}
+        </PanelHost>
+        <PanelHost active={tab === 'journal'}>
+          <JournalPanel />
+        </PanelHost>
       </div>
     </aside>
+  )
+}
+
+/** Wrapper that keeps a tab's content mounted but visibility-toggles
+ * it. `hidden` applies `display: none` so the inactive panel takes no
+ * layout space, while React keeps its state and effects alive. */
+function PanelHost({
+  active,
+  children,
+}: {
+  active: boolean
+  children: React.ReactNode
+}) {
+  return (
+    <div hidden={!active} className={active ? 'h-full' : ''}>
+      {children}
+    </div>
   )
 }

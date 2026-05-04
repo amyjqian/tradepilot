@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BASE_URL,
   fetchBrokerStatus,
+  fetchConnections,
   fetchRiskStatus,
   resetRisk,
 } from './api'
@@ -10,7 +11,9 @@ import type {
   BrokerPosition,
   BrokerSnapshot,
   BrokerStatus,
+  ConnectionInfo,
   OrderRecord,
+  OrderTarget,
   RiskStatus,
 } from './types'
 
@@ -26,6 +29,13 @@ interface BrokerData {
    * broker's `default_account`; persisted in localStorage. */
   selectedAccount: string | null
   setSelectedAccount: (acct: string | null) => void
+  /** Configured TWS connections + their live accounts. */
+  connections: ConnectionInfo[]
+  /** One row per (connection, account) the user has checked as an
+   * order destination. Empty list = use the broker's default. */
+  selectedTargets: OrderTarget[]
+  setSelectedTargets: (targets: OrderTarget[]) => void
+  refreshConnections: () => Promise<void>
   error: string | null
   refresh: () => Promise<void>
   resetKillSwitch: () => Promise<void>
@@ -48,8 +58,24 @@ type StreamEvent =
     }
 
 const SELECTED_ACCOUNT_KEY = 'tradepilot.selected_account'
+const SELECTED_TARGETS_KEY = 'tradepilot.selected_targets'
 
 const RECONNECT_DELAY_MS = 3_000
+
+function loadStoredTargets(): OrderTarget[] {
+  try {
+    const raw = window.localStorage.getItem(SELECTED_TARGETS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((x): x is OrderTarget =>
+        x && typeof x === 'object' && (typeof x.connection === 'string' || x.connection === undefined),
+      )
+  } catch {
+    return []
+  }
+}
 
 /**
  * Subscribes to /broker/stream (SSE) for live broker state. The initial
@@ -66,17 +92,45 @@ export function useBrokerData(): BrokerData {
   const [positions, setPositions] = useState<BrokerPosition[]>([])
   const [orders, setOrders] = useState<OrderRecord[]>([])
   const [risk, setRisk] = useState<RiskStatus | null>(null)
-  const [accounts, setAccounts] = useState<string[]>([])
+  const [legacyAccounts, setLegacyAccounts] = useState<string[]>([])
   const [selectedAccount, setSelectedAccountState] = useState<string | null>(
     () => window.localStorage.getItem(SELECTED_ACCOUNT_KEY),
   )
   const [error, setError] = useState<string | null>(null)
   const [liveAcknowledged, setLiveAcknowledged] = useState(false)
+  const [connections, setConnections] = useState<ConnectionInfo[]>([])
+  const [selectedTargets, setSelectedTargetsState] = useState<OrderTarget[]>(
+    () => loadStoredTargets(),
+  )
+
+  // Flat list of all accounts visible across all connections — drop-in
+  // replacement for the old `accounts: string[]` so the existing
+  // single-select UI still has something to render.
+  const accounts = useMemo<string[]>(() => {
+    if (connections.length === 0) return legacyAccounts
+    const all: string[] = []
+    for (const c of connections) for (const a of c.accounts) all.push(a)
+    return all.length > 0 ? all : legacyAccounts
+  }, [connections, legacyAccounts])
 
   const setSelectedAccount = useCallback((acct: string | null) => {
     setSelectedAccountState(acct)
     if (acct) window.localStorage.setItem(SELECTED_ACCOUNT_KEY, acct)
     else window.localStorage.removeItem(SELECTED_ACCOUNT_KEY)
+  }, [])
+
+  const setSelectedTargets = useCallback((targets: OrderTarget[]) => {
+    setSelectedTargetsState(targets)
+    window.localStorage.setItem(SELECTED_TARGETS_KEY, JSON.stringify(targets))
+  }, [])
+
+  const refreshConnections = useCallback(async () => {
+    try {
+      const list = await fetchConnections()
+      setConnections(list)
+    } catch (e) {
+      setError(String(e))
+    }
   }, [])
 
   const sourceRef = useRef<EventSource | null>(null)
@@ -104,7 +158,7 @@ export function useBrokerData(): BrokerData {
     }
   }, [])
 
-  // 1. One-shot status probe on mount (decides whether to open SSE).
+  // 1. One-shot status probe + connections list on mount.
   useEffect(() => {
     let cancelled = false
     fetchBrokerStatus()
@@ -112,7 +166,7 @@ export function useBrokerData(): BrokerData {
         if (cancelled) return
         setStatus(s)
         if (s.accounts && s.accounts.length > 0) {
-          setAccounts(s.accounts)
+          setLegacyAccounts(s.accounts)
         }
       })
       .catch((e) => {
@@ -120,10 +174,25 @@ export function useBrokerData(): BrokerData {
         setError(String(e))
         setStatus({ connected: false, paper: null, hint: null })
       })
+    fetchConnections()
+      .then((list) => {
+        if (cancelled) return
+        setConnections(list)
+      })
+      .catch(() => {
+        // Older API without connections endpoint — just leave empty.
+      })
     return () => {
       cancelled = true
     }
   }, [])
+
+  // Re-poll connections periodically so newly-connected TWS instances
+  // show up without a manual refresh. Cheap call (in-memory state).
+  useEffect(() => {
+    const id = window.setInterval(() => void refreshConnections(), 8_000)
+    return () => window.clearInterval(id)
+  }, [refreshConnections])
 
   // 2. SSE subscription — only if connected.
   useEffect(() => {
@@ -137,13 +206,15 @@ export function useBrokerData(): BrokerData {
 
       es.addEventListener('snapshot', (ev) => {
         try {
-          const snap = JSON.parse((ev as MessageEvent).data) as BrokerSnapshot
-          setAccount(snap.account)
-          setPositions(snap.positions)
-          setOrders(snap.orders)
-          setRisk(snap.risk)
-          if (snap.accounts && snap.accounts.length > 0) {
-            setAccounts(snap.accounts)
+          const snap = JSON.parse((ev as MessageEvent).data) as Partial<BrokerSnapshot>
+          // Be defensive — multi-connection snapshots may omit some
+          // top-level fields, and a malformed payload shouldn't blank the UI.
+          if (snap.account !== undefined) setAccount(snap.account)
+          if (Array.isArray(snap.positions)) setPositions(snap.positions)
+          if (Array.isArray(snap.orders)) setOrders(snap.orders)
+          if (snap.risk !== undefined) setRisk(snap.risk)
+          if (Array.isArray(snap.accounts) && snap.accounts.length > 0) {
+            setLegacyAccounts(snap.accounts)
           }
           setError(null)
         } catch (e) {
@@ -159,7 +230,7 @@ export function useBrokerData(): BrokerData {
             setPositions,
             setOrders,
             setRisk,
-            setAccounts,
+            setAccounts: setLegacyAccounts,
           })
         } catch (e) {
           // Heartbeats arrive as comment lines and don't fire onmessage,
@@ -194,16 +265,37 @@ export function useBrokerData(): BrokerData {
 
   const acknowledgeLive = useCallback(() => setLiveAcknowledged(true), [])
 
-  // Default the selection to the broker's reported default account once
-  // we know it, but only if the user hasn't explicitly picked something
-  // (and the persisted value isn't in the managed list — could happen
-  // after switching IB env to a different account set).
+  // Default the single-account selection (legacy) to the broker's default.
   useEffect(() => {
     if (accounts.length === 0) return
     if (selectedAccount && accounts.includes(selectedAccount)) return
     const fallback = status?.default_account ?? status?.account ?? accounts[0] ?? null
     setSelectedAccount(fallback)
   }, [accounts, selectedAccount, status?.default_account, status?.account, setSelectedAccount])
+
+  // Default `selectedTargets` once we have connections — pick the first
+  // connection's first account so order entry works out of the box.
+  // Skip if the user has already picked something (validated against the
+  // current connection list to drop stale targets after a config edit).
+  useEffect(() => {
+    if (connections.length === 0) return
+    const validKey = (t: OrderTarget) =>
+      connections.some(
+        (c) =>
+          c.label === t.connection &&
+          (t.account === undefined || c.accounts.includes(t.account)),
+      )
+    const valid = selectedTargets.filter(validKey)
+    if (valid.length > 0) {
+      if (valid.length !== selectedTargets.length) setSelectedTargets(valid)
+      return
+    }
+    const firstConn = connections[0]
+    const firstAcct = firstConn.default_account ?? firstConn.accounts[0]
+    if (firstAcct) {
+      setSelectedTargets([{ connection: firstConn.label, account: firstAcct }])
+    }
+  }, [connections, selectedTargets, setSelectedTargets])
 
   return {
     status,
@@ -214,6 +306,10 @@ export function useBrokerData(): BrokerData {
     accounts,
     selectedAccount,
     setSelectedAccount,
+    connections,
+    selectedTargets,
+    setSelectedTargets,
+    refreshConnections,
     error,
     refresh,
     resetKillSwitch,
@@ -239,9 +335,14 @@ function applyStreamEvent(
     case 'position': {
       const next = ev.payload
       setters.setPositions((prev) => {
-        const others = prev.filter((p) => p.symbol !== next.symbol)
-        // Server sends qty=0 to indicate flat — drop it from the list.
-        if (!next.qty) return others
+        // Multi-account / multi-connection: a single symbol can appear
+        // in multiple rows. Dedupe by `(connection, account, symbol)` so
+        // an update to one row never clobbers the others.
+        const key = (p: BrokerPosition) =>
+          `${p.connection ?? ''}::${p.account ?? ''}::${p.symbol}`
+        const nextKey = key(next)
+        const others = prev.filter((p) => key(p) !== nextKey)
+        if (!next.qty) return others // server sends qty=0 to mean "flat"
         return [...others, next]
       })
       return
@@ -249,7 +350,11 @@ function applyStreamEvent(
     case 'order': {
       const next = ev.payload
       setters.setOrders((prev) => {
-        const idx = prev.findIndex((o) => o.id === next.id)
+        // Order ids are unique only per-IB-client, so two connections
+        // can collide. Key by `(connection, id)` to keep them apart.
+        const key = (o: OrderRecord) => `${o.connection ?? ''}::${o.id}`
+        const nextKey = key(next)
+        const idx = prev.findIndex((o) => key(o) === nextKey)
         if (idx === -1) return [next, ...prev].slice(0, 50)
         const copy = prev.slice()
         copy[idx] = next

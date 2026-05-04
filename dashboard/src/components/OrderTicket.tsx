@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react'
 import { cancelOrdersForSymbol, closePosition, submitOrder } from '../api'
-import type { BrokerPosition, OrderRecord, ScanResult } from '../types'
+import type {
+  BrokerPosition,
+  ConnectionInfo,
+  OrderRecord,
+  OrderTarget,
+  ScanResult,
+} from '../types'
 
 // Tick size for US stocks priced ≥ $1. Sub-dollar stocks technically use
 // 0.0001, but the order ticket targets normal liquid names where penny
@@ -36,11 +42,19 @@ type HotKind = 'mkt' | 'mid' | 'bid_or_ask' | 'bid_plus_tick'
 interface Props {
   selected: ScanResult | null
   paper: boolean
-  /** All managed IB accounts visible from the connection. */
+  /** Flat list of every account across all connections — kept for
+   * legacy display surfaces. New code should use `connections`. */
   accounts: string[]
-  /** Currently-selected routing account, or null to use broker default. */
   selectedAccount: string | null
   onSelectAccount: (acct: string | null) => void
+  /** Configured TWS connections with their accounts. Drives the
+   * multi-target picker. */
+  connections: ConnectionInfo[]
+  /** Order destinations: each click on a hot button fans out one IB
+   * placeOrder per target. Empty list = use the connection's default
+   * account on the default connection (legacy behavior). */
+  selectedTargets: OrderTarget[]
+  onSelectTargets: (targets: OrderTarget[]) => void
   liveAcknowledged: boolean
   onLiveConfirmRequested: (onApprove: () => void) => void
   /** Live broker positions — used to enable Flatten/Reverse/TP/SL only
@@ -57,9 +71,9 @@ interface Props {
 export function OrderTicket({
   selected,
   paper,
-  accounts,
-  selectedAccount,
-  onSelectAccount,
+  connections,
+  selectedTargets,
+  onSelectTargets,
   liveAcknowledged,
   onLiveConfirmRequested,
   positions,
@@ -161,7 +175,7 @@ export function OrderTicket({
         time_in_force: 'day',
         ...orderParams,
         ...(score_at_entry !== undefined ? { score_at_entry } : {}),
-        ...(selectedAccount ? { account: selectedAccount } : {}),
+        ...(selectedTargets.length > 0 ? { targets: selectedTargets } : {}),
       })
     })
 
@@ -171,11 +185,19 @@ export function OrderTicket({
 
   const fireClosePct = (percentage: number) => {
     if (!hasPosition) return
+    // Close on the connection holding this position. If the position
+    // came from an aggregated multi-connection feed, `position.connection`
+    // is set; otherwise fall back to the first selected target.
+    const target =
+      position?.connection ?? selectedTargets[0]?.connection ?? undefined
+    const account =
+      position?.account ?? selectedTargets[0]?.account ?? undefined
     guarded(() =>
       wrapSubmit(() =>
         closePosition(symbol, {
           percentage,
-          account: selectedAccount ?? undefined,
+          connection: target,
+          account,
         }),
       ),
     )
@@ -198,7 +220,7 @@ export function OrderTicket({
           side: reverseSide,
           type: 'market',
           time_in_force: 'day',
-          ...(selectedAccount ? { account: selectedAccount } : {}),
+          ...(selectedTargets.length > 0 ? { targets: selectedTargets } : {}),
         }),
       ),
     )
@@ -206,6 +228,8 @@ export function OrderTicket({
 
   const fireCancel = () => {
     if (symbolWorkingCount === 0) return
+    // No connection scope — backend broadcasts to every connection so a
+    // user with multiple TWS instances clears all of them at once.
     guarded(() => wrapSubmit(() => cancelOrdersForSymbol(symbol)))
   }
 
@@ -228,7 +252,7 @@ export function OrderTicket({
           type: 'limit',
           time_in_force: 'gtc',
           limit_price,
-          ...(selectedAccount ? { account: selectedAccount } : {}),
+          ...(selectedTargets.length > 0 ? { targets: selectedTargets } : {}),
         }),
       ),
     )
@@ -249,7 +273,7 @@ export function OrderTicket({
           type: 'stop',
           time_in_force: 'gtc',
           stop_price,
-          ...(selectedAccount ? { account: selectedAccount } : {}),
+          ...(selectedTargets.length > 0 ? { targets: selectedTargets } : {}),
         }),
       ),
     )
@@ -257,25 +281,11 @@ export function OrderTicket({
 
   return (
     <div className="space-y-2 text-xs">
-      {accounts.length > 1 && (
-        <label
-          className="flex items-center justify-between gap-2"
-          title="IB account this order will route to. Persists per session."
-        >
-          <span className="text-[10px] uppercase tracking-wide text-neutral-500">
-            Account
-          </span>
-          <select
-            value={selectedAccount ?? ''}
-            onChange={(e) => onSelectAccount(e.target.value || null)}
-            className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-xs num"
-          >
-            {accounts.map((a) => (
-              <option key={a} value={a}>{a}</option>
-            ))}
-          </select>
-        </label>
-      )}
+      <TargetPicker
+        connections={connections}
+        selectedTargets={selectedTargets}
+        onSelectTargets={onSelectTargets}
+      />
 
       <QtySelector value={hotQty} onChange={setHotQty} />
 
@@ -325,6 +335,112 @@ export function OrderTicket({
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100
+}
+
+// ---------------------------------------------------------------------
+// Multi-target picker — checkbox list of (connection, account) pairs.
+// One click submission fans out an order to every checked target.
+// Hidden when only one (connection, account) exists in total — no point
+// taking up panel space if the user has nothing to choose.
+// ---------------------------------------------------------------------
+
+function TargetPicker({
+  connections,
+  selectedTargets,
+  onSelectTargets,
+}: {
+  connections: ConnectionInfo[]
+  selectedTargets: OrderTarget[]
+  onSelectTargets: (t: OrderTarget[]) => void
+}) {
+  const allPairs = connections.flatMap((c) =>
+    c.accounts.map((a) => ({ connection: c.label, account: a, paper: c.paper, connected: c.connected })),
+  )
+  if (allPairs.length <= 1) {
+    // Single (or no) account: nothing to pick. Selection is implicit.
+    return null
+  }
+
+  const isChecked = (conn: string, acct: string) =>
+    selectedTargets.some((t) => t.connection === conn && t.account === acct)
+
+  const toggle = (conn: string, acct: string) => {
+    if (isChecked(conn, acct)) {
+      onSelectTargets(
+        selectedTargets.filter(
+          (t) => !(t.connection === conn && t.account === acct),
+        ),
+      )
+    } else {
+      onSelectTargets([...selectedTargets, { connection: conn, account: acct }])
+    }
+  }
+
+  const selectAll = () =>
+    onSelectTargets(
+      allPairs.map((p) => ({ connection: p.connection, account: p.account })),
+    )
+  const selectNone = () => onSelectTargets([])
+  const selectedCount = selectedTargets.length
+
+  return (
+    <div className="rounded border border-neutral-800 bg-neutral-900/40 p-1.5">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-[10px] uppercase tracking-wide text-neutral-500">
+          Route to ({selectedCount}/{allPairs.length})
+        </span>
+        <span className="flex gap-1">
+          <button
+            type="button"
+            onClick={selectAll}
+            className="rounded border border-neutral-700 px-1 py-0 text-[9px] font-semibold text-neutral-400 hover:border-neutral-500 hover:text-neutral-200"
+            title="Route every following order to every (connection, account)"
+          >
+            ALL
+          </button>
+          <button
+            type="button"
+            onClick={selectNone}
+            className="rounded border border-neutral-700 px-1 py-0 text-[9px] font-semibold text-neutral-400 hover:border-neutral-500 hover:text-neutral-200"
+            title="Clear all targets — orders will go to the broker default"
+          >
+            NONE
+          </button>
+        </span>
+      </div>
+      <ul className="max-h-24 space-y-0.5 overflow-y-auto">
+        {allPairs.map((p) => {
+          const checked = isChecked(p.connection, p.account)
+          return (
+            <li key={`${p.connection}::${p.account}`}>
+              <label
+                className="flex cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 hover:bg-neutral-800"
+                title={`${p.connection} → ${p.account}${p.paper ? ' (paper)' : ' (live)'}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggle(p.connection, p.account)}
+                  className="h-3 w-3 cursor-pointer accent-[var(--color-accent)]"
+                />
+                <span className={`text-[10px] uppercase tracking-wide ${p.connected ? 'text-neutral-500' : 'text-neutral-600'}`}>
+                  {p.connection}
+                </span>
+                <span className="num text-[11px] font-semibold text-neutral-200">
+                  {p.account}
+                </span>
+                {!p.paper && (
+                  <span className="ml-auto text-[9px] uppercase tracking-wide text-[var(--color-danger)]">
+                    live
+                  </span>
+                )}
+              </label>
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------

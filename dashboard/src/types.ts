@@ -128,6 +128,50 @@ export interface BrokerPosition {
   unrealized_pl_abs: number
   unrealized_pl_pct: number
   side: string
+  /** Source TWS connection label. Tagged by the API when aggregating
+   * across multiple connections; absent in single-connection legacy
+   * payloads. */
+  connection?: string
+  /** IB account holding this position. Set when known. */
+  account?: string
+}
+
+/** Connection definition + live status (`/broker/connections`). */
+export interface ConnectionInfo {
+  label: string
+  host: string
+  port: number
+  client_id: number
+  paper: boolean
+  auto_connect: boolean
+  default_account: string | null
+  /** Managed accounts visible from this connection. Empty before the
+   * first successful TWS handshake. */
+  accounts: string[]
+  connected: boolean
+}
+
+/** Per-account financial summary (`/broker/accounts-summary`). One row
+ * per (connection, account). Numbers are floats in the account's
+ * currency (assumed USD). */
+export interface AccountSummaryRow {
+  connection: string
+  account: string
+  paper: boolean
+  alias: string
+  net_liquidation: number
+  total_cash: number
+  excess_liquidity: number
+  realized_pnl: number
+  unrealized_pnl: number
+  daily_pnl: number
+}
+
+/** One destination for a fan-out order. Either field may be omitted —
+ * the server falls back to default connection / default account. */
+export interface OrderTarget {
+  connection?: string
+  account?: string
 }
 
 export interface CloseAllResult {
@@ -150,6 +194,10 @@ export interface OrderRecord {
   submitted_at: string | null
   filled_at: string | null
   filled_avg_price: number | null
+  /** Connection label this order was placed through. Tagged by the API. */
+  connection?: string
+  /** IB account this order routed to. Set when known. */
+  account?: string
 }
 
 export interface SubmitOrderRequest {
@@ -171,9 +219,20 @@ export interface SubmitOrderRequest {
   /** Pegged-to-Primary (REL) lmtPrice — hard ceiling (BUY) / floor
    * (SELL). Only used when `type === 'pegprim'`. */
   cap_price?: number
-  /** Optional IB account to route the order to. Must be in the broker's
-   * managed-accounts list. Omit to use the broker's default account. */
+  /** Multi-target fan-out. One IB placeOrder per entry — each gets its
+   * own row in the response's `orders[]`. Preferred over the legacy
+   * `account` / `connection` fields. */
+  targets?: OrderTarget[]
+  /** Legacy single-target shorthand. Only used when `targets` is absent. */
+  connection?: string
   account?: string
+}
+
+/** Response from `POST /broker/orders`. The order is placed once per
+ * target, so even single-target callers get a list back. */
+export interface SubmitOrderResponse {
+  orders: OrderRecord[]
+  failures: Array<{ connection?: string; account?: string; error: string }>
 }
 
 export interface RiskStatus {

@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchWatchlist, runScan, saveWatchlist } from '../api'
 import type { ScanResponse, ScanResult } from '../types'
 import { fmtNumber, fmtPct } from '../format'
 import { useResultFilters } from '../useResultFilters'
+import { useCountdown } from '../useCountdown'
 import { ResultFilters } from './ResultFilters'
+import { AutoRescanStrip } from './AutoRescanStrip'
 
 interface Props {
   provider: string
@@ -12,6 +14,18 @@ interface Props {
   selected: string | null
   onSelect: (r: ScanResult) => void
   onError: (msg: string | null) => void
+}
+
+// Same auto-rescan presets as the sector panel; 0 = off. Persisted
+// per-user in localStorage so the cadence survives reloads / tab
+// switches. The timer keeps cycling while the user is on another tab
+// because the panel stays mounted (see LeftRail's PanelHost).
+const RESCAN_OPTIONS = [0, 1, 2, 5, 15, 30, 60] as const
+const RESCAN_KEY = 'tradepilot.watchlist_rescan_min'
+
+function loadStoredRescan(): number {
+  const n = Number(window.localStorage.getItem(RESCAN_KEY))
+  return RESCAN_OPTIONS.includes(n as (typeof RESCAN_OPTIONS)[number]) ? n : 0
 }
 
 export function WatchlistPanel({
@@ -27,7 +41,19 @@ export function WatchlistPanel({
   const [draft, setDraft] = useState('')
   const [scan, setScan] = useState<ScanResponse | null>(null)
   const [loading, setLoading] = useState(false)
+  const [rescanMin, setRescanMinState] = useState<number>(() => loadStoredRescan())
+  const [lastRunAt, setLastRunAt] = useState<Date | null>(null)
+  const [nextRunAt, setNextRunAt] = useState<Date | null>(null)
+  const [runStartedAt, setRunStartedAt] = useState<Date | null>(null)
+  const [runEndedAt, setRunEndedAt] = useState<Date | null>(null)
+  const inFlightRef = useRef(false)
   const filters = useResultFilters()
+  const countdown = useCountdown(lastRunAt, nextRunAt, rescanMin > 0)
+
+  const setRescanMin = (n: number) => {
+    setRescanMinState(n)
+    window.localStorage.setItem(RESCAN_KEY, String(n))
+  }
 
   useEffect(() => {
     fetchWatchlist()
@@ -37,9 +63,16 @@ export function WatchlistPanel({
 
   const run = useCallback(async () => {
     if (tickers.length === 0) {
-      onError('Add tickers to the watchlist first.')
+      // Auto-rescan firing on an empty watchlist would spam this
+      // error; only show it when the user explicitly clicks.
+      if (!inFlightRef.current) onError('Add tickers to the watchlist first.')
       return
     }
+    if (inFlightRef.current) return
+    inFlightRef.current = true
+    const startedAt = new Date()
+    setRunStartedAt(startedAt)
+    setRunEndedAt(null)
     onError(null)
     setLoading(true)
     try {
@@ -49,12 +82,50 @@ export function WatchlistPanel({
         tickers,
       })
       setScan(res)
+      setLastRunAt(new Date())
     } catch (e) {
       onError(String(e))
     } finally {
       setLoading(false)
+      setRunEndedAt(new Date())
+      inFlightRef.current = false
     }
   }, [provider, interval, lookback, tickers, onError])
+
+  // Auto-rescan, aligned to wall-clock boundaries + 5 seconds. See
+  // SectorRotationPanel for the rationale; same self-rescheduling
+  // setTimeout pattern to avoid drift over long sessions.
+  useEffect(() => {
+    if (rescanMin <= 0) {
+      setNextRunAt(null)
+      return
+    }
+    if (tickers.length === 0) {
+      setNextRunAt(null)
+      return
+    }
+    if (!scan && !inFlightRef.current) void run()
+
+    let timeoutId: number | null = null
+    const schedule = () => {
+      const period = rescanMin * 60_000
+      const now = Date.now()
+      const boundary = Math.floor(now / period) * period + period
+      const target = boundary + 5_000
+      setNextRunAt(new Date(target))
+      timeoutId = window.setTimeout(() => {
+        timeoutId = null
+        void run()
+        schedule()
+      }, Math.max(0, target - now))
+    }
+    schedule()
+
+    return () => {
+      if (timeoutId !== null) window.clearTimeout(timeoutId)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rescanMin, run, tickers.length])
 
   const startEdit = () => {
     setDraft(tickers.join(', '))
@@ -86,6 +157,25 @@ export function WatchlistPanel({
         >
           {loading ? 'Scanning…' : `Scan Watchlist (${tickers.length})`}
         </button>
+        <label
+          className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-neutral-500"
+          title="Auto-rescan cadence. Survives tab switches and reloads."
+        >
+          Auto
+          <select
+            value={rescanMin}
+            onChange={(e) => setRescanMin(Number(e.target.value))}
+            className="rounded border border-neutral-700 bg-neutral-900 px-1 py-0.5 text-xs text-neutral-100"
+          >
+            <option value={0}>Off</option>
+            <option value={1}>1m</option>
+            <option value={2}>2m</option>
+            <option value={5}>5m</option>
+            <option value={15}>15m</option>
+            <option value={30}>30m</option>
+            <option value={60}>60m</option>
+          </select>
+        </label>
         <button
           type="button"
           onClick={editing ? saveEdit : startEdit}
@@ -95,6 +185,15 @@ export function WatchlistPanel({
           {editing ? 'Save' : 'Edit'}
         </button>
       </div>
+      {rescanMin > 0 && (
+        <AutoRescanStrip
+          rescanMin={rescanMin}
+          loading={loading}
+          countdown={countdown}
+          runStartedAt={runStartedAt}
+          runEndedAt={runEndedAt}
+        />
+      )}
 
       {editing && (
         <textarea

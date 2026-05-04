@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { runSectorRotation } from '../api'
 import type { ScanResult, SectorRotationResponse } from '../types'
 import { fmtNumber, fmtPct } from '../format'
 import { useResultFilters } from '../useResultFilters'
+import { useCountdown } from '../useCountdown'
 import { ResultFilters } from './ResultFilters'
+import { AutoRescanStrip } from './AutoRescanStrip'
 
 interface Props {
   provider: string
@@ -12,6 +14,16 @@ interface Props {
   selected: string | null
   onSelect: (r: ScanResult) => void
   onError: (msg: string | null) => void
+}
+
+// Auto-rescan presets in minutes; 0 = off. Persisted per-user so the
+// timer keeps cycling across reloads.
+const RESCAN_OPTIONS = [0, 1, 2, 5, 15, 30, 60] as const
+const RESCAN_KEY = 'tradepilot.sector_rescan_min'
+
+function loadStoredRescan(): number {
+  const n = Number(window.localStorage.getItem(RESCAN_KEY))
+  return RESCAN_OPTIONS.includes(n as (typeof RESCAN_OPTIONS)[number]) ? n : 0
 }
 
 export function SectorRotationPanel({
@@ -27,9 +39,32 @@ export function SectorRotationPanel({
   const [topN, setTopN] = useState<number>(2)
   /** ETF symbol the user clicked to drill into; `null` = pooled view of all top-N. */
   const [activeSector, setActiveSector] = useState<string | null>(null)
+  const [rescanMin, setRescanMinState] = useState<number>(() => loadStoredRescan())
+  const [lastRunAt, setLastRunAt] = useState<Date | null>(null)
+  const [nextRunAt, setNextRunAt] = useState<Date | null>(null)
+  // Track when the current/last scan started and finished. Both
+  // displayed in the auto-rescan strip so the user sees both fetch
+  // latency and "freshness" at a glance.
+  const [runStartedAt, setRunStartedAt] = useState<Date | null>(null)
+  const [runEndedAt, setRunEndedAt] = useState<Date | null>(null)
+  const inFlightRef = useRef(false)
   const filters = useResultFilters()
+  const countdown = useCountdown(lastRunAt, nextRunAt, rescanMin > 0)
+
+  const setRescanMin = (n: number) => {
+    setRescanMinState(n)
+    window.localStorage.setItem(RESCAN_KEY, String(n))
+  }
 
   const run = useCallback(async () => {
+    // Drop overlapping calls — auto-rescan + a manual click shouldn't
+    // double-fetch, and a slow IB-pacing response shouldn't queue up
+    // back-to-back rescans.
+    if (inFlightRef.current) return
+    inFlightRef.current = true
+    const startedAt = new Date()
+    setRunStartedAt(startedAt)
+    setRunEndedAt(null)
     onError(null)
     setLoading(true)
     try {
@@ -40,12 +75,49 @@ export function SectorRotationPanel({
       })
       setData(res)
       setActiveSector(null)
+      setLastRunAt(new Date())
     } catch (e) {
       onError(String(e))
     } finally {
       setLoading(false)
+      setRunEndedAt(new Date())
+      inFlightRef.current = false
     }
   }, [provider, interval, lookback, topN, onError])
+
+  // Auto-rescan, aligned to wall-clock boundaries + 5 seconds. Picking
+  // "5m" at 09:32:17 fires the next scan at 09:35:05, then 09:40:05,
+  // 09:45:05, … — so the scan always runs a few seconds *after* the
+  // freshly-closed bar publishes on Polygon (which takes ~1–3 s) and
+  // never sooner than the cache TTL. We use a self-rescheduling
+  // setTimeout (not setInterval) to avoid drift over long sessions.
+  useEffect(() => {
+    if (rescanMin <= 0) {
+      setNextRunAt(null)
+      return
+    }
+    if (!data && !inFlightRef.current) void run()
+
+    let timeoutId: number | null = null
+    const schedule = () => {
+      const period = rescanMin * 60_000
+      const now = Date.now()
+      const boundary = Math.floor(now / period) * period + period
+      const target = boundary + 5_000
+      setNextRunAt(new Date(target))
+      timeoutId = window.setTimeout(() => {
+        timeoutId = null
+        void run()
+        schedule()
+      }, Math.max(0, target - now))
+    }
+    schedule()
+
+    return () => {
+      if (timeoutId !== null) window.clearTimeout(timeoutId)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rescanMin, run])
 
   // If a re-rank changes the top-N sectors, drop a stale activeSector
   // selection that no longer points at a top-N row.
@@ -108,7 +180,35 @@ export function SectorRotationPanel({
             <option value={3}>3</option>
           </select>
         </label>
+        <label
+          className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-neutral-500"
+          title="Auto-rescan cadence. Survives tab switches and reloads."
+        >
+          Auto
+          <select
+            value={rescanMin}
+            onChange={(e) => setRescanMin(Number(e.target.value))}
+            className="rounded border border-neutral-700 bg-neutral-900 px-1 py-0.5 text-xs text-neutral-100"
+          >
+            <option value={0}>Off</option>
+            <option value={1}>1m</option>
+            <option value={2}>2m</option>
+            <option value={5}>5m</option>
+            <option value={15}>15m</option>
+            <option value={30}>30m</option>
+            <option value={60}>60m</option>
+          </select>
+        </label>
       </div>
+      {rescanMin > 0 && (
+        <AutoRescanStrip
+          rescanMin={rescanMin}
+          loading={loading}
+          countdown={countdown}
+          runStartedAt={runStartedAt}
+          runEndedAt={runEndedAt}
+        />
+      )}
 
       {!data && !loading && (
         <p className="text-xs text-neutral-500">

@@ -278,11 +278,17 @@ class BrokerState:
         sym = str(pos_dict.get("symbol") or "")
         if not sym:
             return
+        # Key by `(account, symbol)` so multi-account positions in the
+        # same name don't clobber each other. `account` may be empty in
+        # legacy callers — fall back to "" so the original single-account
+        # behavior still works.
+        acct = str(pos_dict.get("account") or "")
+        key = f"{acct}::{sym}"
         with self._lock:
             if pos_dict.get("qty", 0) == 0:
-                self._positions.pop(sym, None)
+                self._positions.pop(key, None)
             else:
-                self._positions[sym] = pos_dict
+                self._positions[key] = pos_dict
         self._broadcast({"kind": "position", "payload": pos_dict})
 
     def on_account_update(self, account: dict[str, Any]) -> None:

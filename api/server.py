@@ -26,7 +26,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from scanner.backtest import backtest
-from scanner.broker import IBBroker, Journal, KillSwitchActive, get_broker
+from scanner.broker import IBBroker, IBBrokerConfig, Journal, KillSwitchActive, get_broker
+from scanner.broker.connections import (
+    ConnectionConfig,
+    load_aliases,
+    load_connections,
+    save_aliases,
+    save_connections,
+)
 from scanner.config import ScannerConfig
 from scanner.data import MarketDataProvider, get_provider
 from scanner.data.ib_provider import PacingBudgetExhausted
@@ -73,26 +80,134 @@ class _State:
         self.cache_ttl_sec: float = 60.0
         self._providers: dict[str, MarketDataProvider] = {}
         self._providers_lock = threading.Lock()
-        self._broker: IBBroker | None | _Sentinel = _UNSET
-        self._broker_lock = threading.Lock()
+        # Multi-connection broker registry. Keys are connection labels
+        # from connections.json. Brokers are instantiated lazily — first
+        # call to broker(label) builds the IBBroker; ib_async's TCP
+        # connect is in turn lazy inside the broker, so a configured
+        # connection that the UI never touches costs nothing.
+        self._broker_lock = threading.RLock()
+        self._connections: dict[str, IBBroker] = {}
+        self._connection_configs: list[ConnectionConfig] | None = None
         self._quote_streamer: Any = None
         self._quote_streamer_lock = threading.Lock()
 
-    def broker(self) -> IBBroker | None:
-        """Return the configured broker, or None if intentionally disabled.
+    # -- multi-connection broker registry ----------------------------------
 
-        Cached after the first attempt. The connection itself is lazy
-        inside IBBroker; this just builds the wrapper so we don't re-read
-        env vars on every request.
-        """
+    def list_connections(self) -> list[ConnectionConfig]:
+        """Connection definitions in display order. Loaded from disk on
+        first call and cached; mutating endpoints invalidate via
+        `_replace_connections`."""
         with self._broker_lock:
-            if self._broker is _UNSET:
-                self._broker = get_broker()
-            return self._broker  # type: ignore[return-value]
+            if self._connection_configs is None:
+                self._connection_configs = load_connections()
+            return list(self._connection_configs)
+
+    def _replace_connections(self, items: list[ConnectionConfig]) -> None:
+        """Persist a new connection list and invalidate the in-memory
+        cache. Live brokers for now-removed labels are left running so
+        in-flight requests don't crash; they'll be cleaned up on shutdown
+        or on explicit disconnect."""
+        save_connections(items)
+        with self._broker_lock:
+            self._connection_configs = list(items)
+
+    def _resolve_label(self, label: str | None) -> str | None:
+        """Pick the default connection label when the caller didn't.
+
+        Order of preference: label explicitly passed → first
+        `auto_connect` config → first config overall → None (no
+        connections defined at all).
+        """
+        configs = self.list_connections()
+        if not configs:
+            return None
+        if label is not None:
+            return label if any(c.label == label for c in configs) else None
+        auto = next((c for c in configs if c.auto_connect), None)
+        return (auto or configs[0]).label
+
+    def broker(self, label: str | None = None) -> IBBroker | None:
+        """Return the broker for the given connection (default if None).
+
+        Lazily instantiates the IBBroker the first time a label is
+        touched. The TCP connect inside IBBroker is also lazy, so
+        instantiation here is essentially free.
+        """
+        resolved = self._resolve_label(label)
+        if resolved is None:
+            return None
+        with self._broker_lock:
+            existing = self._connections.get(resolved)
+            if existing is not None:
+                return existing
+            cfg = next(
+                (c for c in self.list_connections() if c.label == resolved),
+                None,
+            )
+            if cfg is None:
+                return None
+            broker_cfg = cfg.to_broker_config(_CACHE_DIR / "journal.sqlite")
+            broker = IBBroker(broker_cfg)
+            self._connections[resolved] = broker
+            return broker
+
+    def all_brokers(self) -> list[tuple[str, IBBroker]]:
+        """(label, broker) for every connection with an instantiated
+        broker. Does not trigger lazy instantiation — `eager_init` does
+        that. Used by aggregating endpoints."""
+        with self._broker_lock:
+            return list(self._connections.items())
+
+    def eager_init_auto_connect(self) -> None:
+        """Instantiate all `auto_connect` brokers up-front so aggregating
+        reads (positions, orders) see them without a prior per-label
+        request. Connections still establish lazily on first IB call.
+        """
+        for c in self.list_connections():
+            if c.auto_connect:
+                self.broker(c.label)
+
+    def account_to_label(self, account: str) -> str | None:
+        """Reverse-lookup: which connection owns this IB account?
+        Returns None if no instantiated broker reports it."""
+        if not account:
+            return None
+        for label, broker in self.all_brokers():
+            try:
+                if account in broker.accounts:
+                    return label
+            except Exception:
+                continue
+        return None
+
+    def disconnect_label(self, label: str) -> bool:
+        """Disconnect and remove one broker by label. Returns True if a
+        broker existed for that label."""
+        with self._broker_lock:
+            broker = self._connections.pop(label, None)
+        if broker is None:
+            return False
+        disc = getattr(broker, "disconnect", None)
+        if callable(disc):
+            try:
+                disc()
+            except Exception:
+                log.exception("Broker %s disconnect failed", label)
+        return True
 
     def reset_broker(self) -> None:
+        """Tear down every connection. Used by tests and by callers that
+        previously assumed the single-broker design."""
         with self._broker_lock:
-            self._broker = _UNSET
+            brokers = list(self._connections.items())
+            self._connections.clear()
+        for label, broker in brokers:
+            disc = getattr(broker, "disconnect", None)
+            if callable(disc):
+                try:
+                    disc()
+                except Exception:
+                    log.exception("Broker %s disconnect failed", label)
 
     def quote_streamer(self) -> Any:
         """Lazy singleton for the Polygon WebSocket quote streamer. The
@@ -147,17 +262,17 @@ class _State:
                 disconnect()
             except Exception:
                 log.exception("Provider %s disconnect failed", name)
-        # Disconnect the broker too so its background loop thread exits.
+        # Disconnect every broker so background loop threads exit.
         with self._broker_lock:
-            broker = self._broker if not isinstance(self._broker, _Sentinel) else None
-            self._broker = _UNSET
-        if broker is not None:
+            brokers = list(self._connections.items())
+            self._connections.clear()
+        for label, broker in brokers:
             disc = getattr(broker, "disconnect", None)
             if callable(disc):
                 try:
                     disc()
                 except Exception:
-                    log.exception("Broker disconnect failed")
+                    log.exception("Broker %s disconnect failed", label)
         # Stop the Polygon WebSocket loop too.
         with self._quote_streamer_lock:
             streamer = self._quote_streamer
@@ -167,13 +282,6 @@ class _State:
                 streamer.stop()
             except Exception:
                 log.exception("Quote streamer stop failed")
-
-
-class _Sentinel:
-    """Distinguishes 'broker not yet probed' from 'probed and unavailable'."""
-
-
-_UNSET = _Sentinel()
 
 
 _state = _State()
@@ -186,6 +294,17 @@ _CACHE_DIR = Path(
         str(Path(__file__).resolve().parent.parent / "data_cache"),
     )
 )
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    """Pre-instantiate auto-connect brokers so aggregating reads
+    (positions across all connections) see every configured connection
+    on the very first call. Each broker's TCP connect remains lazy."""
+    try:
+        _state.eager_init_auto_connect()
+    except Exception:
+        log.exception("eager_init_auto_connect failed (non-fatal)")
 
 
 @app.on_event("shutdown")
@@ -221,6 +340,16 @@ class WatchlistRequest(BaseModel):
     tickers: list[str]
 
 
+class OrderTarget(BaseModel):
+    """One destination for a fan-out order: which connection to route
+    through, and which IB account on that connection to credit. Either
+    field may be omitted; in that case the server falls back to the
+    default connection / the broker's default account."""
+
+    connection: str | None = None
+    account: str | None = None
+
+
 class OrderRequest(BaseModel):
     symbol: str
     qty: float
@@ -243,8 +372,14 @@ class OrderRequest(BaseModel):
     # floor for SELL).
     peg_offset: float | None = None
     cap_price: float | None = None
-    # Optional IB account to route the order to. Must be in the broker's
-    # managed-accounts list. None → broker's default account.
+    # Multi-target fan-out. Each entry produces one IB placeOrder. If
+    # omitted, the server uses `connection` + `account` (legacy single-
+    # target shape) or, lacking both, the default connection + default
+    # account.
+    targets: list[OrderTarget] | None = None
+    # Legacy single-target shorthand. Equivalent to
+    # `targets=[OrderTarget(connection=..., account=...)]`.
+    connection: str | None = None
     account: str | None = None
 
 
@@ -525,93 +660,356 @@ def put_watchlist(req: WatchlistRequest) -> dict[str, list[str]]:
     return {"tickers": _write_watchlist(req.tickers)}
 
 
+def _connection_payload(cfg: ConnectionConfig) -> dict[str, Any]:
+    """Render a connection config + live status for the API. Never
+    raises — connection probes are best-effort."""
+    broker = None
+    with _state._broker_lock:
+        broker = _state._connections.get(cfg.label)
+    accounts: list[str] = []
+    paper: bool | None = None
+    default_account: str | None = cfg.default_account
+    connected = False
+    if broker is not None:
+        try:
+            accounts = list(broker.accounts)
+            paper = broker.paper
+            default_account = broker.default_account
+            # Accounts is populated at first successful connect; treat
+            # its presence as "we've got a live socket."
+            connected = bool(accounts)
+        except Exception:
+            pass
+    return {
+        "label": cfg.label,
+        "host": cfg.host,
+        "port": cfg.port,
+        "client_id": cfg.client_id,
+        "paper": cfg.paper if paper is None else paper,
+        "auto_connect": cfg.auto_connect,
+        "default_account": default_account,
+        "accounts": accounts,
+        "connected": connected,
+    }
+
+
+@app.get("/broker/connections")
+def broker_connections() -> dict[str, Any]:
+    """List every configured TWS connection and its live state.
+
+    The frontend uses this to render the connection→accounts picker for
+    multi-target order entry. Calling this also lazy-instantiates any
+    `auto_connect` brokers that haven't been touched yet.
+    """
+    return {"connections": [_connection_payload(c) for c in _state.list_connections()]}
+
+
+@app.post("/broker/connections/{label}/connect")
+def broker_connection_connect(label: str) -> dict[str, Any]:
+    """Force a connect on the named connection. Returns the same
+    payload shape as `/broker/connections` for that one row."""
+    cfg = next((c for c in _state.list_connections() if c.label == label), None)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail=f"connection {label!r} not configured")
+    b = _state.broker(label)
+    if b is None:
+        raise HTTPException(status_code=503, detail=f"broker {label!r} unavailable")
+    try:
+        # Touching get_account triggers ib_async's lazy connect.
+        b.get_account()
+    except Exception as exc:
+        log.warning("broker connect %s failed: %r", label, exc)
+        # Don't error — return current state so the UI can show the failure
+    return _connection_payload(cfg)
+
+
+@app.post("/broker/connections/{label}/disconnect")
+def broker_connection_disconnect(label: str) -> dict[str, Any]:
+    cfg = next((c for c in _state.list_connections() if c.label == label), None)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail=f"connection {label!r} not configured")
+    _state.disconnect_label(label)
+    return _connection_payload(cfg)
+
+
+class ConnectionUpsertRequest(BaseModel):
+    """Body for `POST /broker/connections` (create) and `PUT
+    /broker/connections/{label}` (update). Only `label`, `host`, `port`,
+    `client_id` are mandatory."""
+
+    label: str
+    host: str = "127.0.0.1"
+    port: int = 7497
+    client_id: int = 28
+    paper: bool = True
+    auto_connect: bool = True
+    default_account: str | None = None
+
+
+def _validate_connection_request(
+    req: ConnectionUpsertRequest, *, exclude_label: str | None = None,
+) -> ConnectionConfig:
+    label = req.label.strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label required")
+    existing = _state.list_connections()
+    for c in existing:
+        if c.label == label and c.label != exclude_label:
+            raise HTTPException(status_code=409, detail=f"label {label!r} already exists")
+        # client_id collisions are silent footguns — IB will boot one
+        # client out the next time TWS reconnects. Surface it now.
+        if c.client_id == int(req.client_id) and c.label != exclude_label:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"client_id {req.client_id} already used by connection "
+                    f"{c.label!r}; pick a different number"
+                ),
+            )
+    return ConnectionConfig(
+        label=label,
+        host=req.host.strip() or "127.0.0.1",
+        port=int(req.port),
+        client_id=int(req.client_id),
+        paper=bool(req.paper),
+        auto_connect=bool(req.auto_connect),
+        default_account=(
+            req.default_account.strip() if req.default_account else None
+        ),
+    )
+
+
+@app.post("/broker/connections")
+def broker_connection_create(req: ConnectionUpsertRequest) -> dict[str, Any]:
+    """Add a new TWS connection. Persists to `connections.json`. The
+    broker is *not* eagerly connected — call POST .../connect after."""
+    cfg = _validate_connection_request(req)
+    items = _state.list_connections() + [cfg]
+    _state._replace_connections(items)
+    return _connection_payload(cfg)
+
+
+@app.put("/broker/connections/{label}")
+def broker_connection_update(
+    label: str, req: ConnectionUpsertRequest,
+) -> dict[str, Any]:
+    """Edit a connection's host/port/client_id/etc. If the connection
+    is currently up and any field changed, the existing socket is torn
+    down so a `POST .../connect` reads the new values."""
+    items = _state.list_connections()
+    if not any(c.label == label for c in items):
+        raise HTTPException(status_code=404, detail=f"connection {label!r} not configured")
+    new_cfg = _validate_connection_request(req, exclude_label=label)
+    # Force-disconnect the live broker — its `_cfg` is stale.
+    _state.disconnect_label(label)
+    next_items = [new_cfg if c.label == label else c for c in items]
+    # If the label itself was renamed, drop the old entry by label too
+    # (already handled if names match, but defensive).
+    if new_cfg.label != label:
+        next_items = [c for c in next_items if c.label != label] + [new_cfg]
+        _state.disconnect_label(label)
+    _state._replace_connections(next_items)
+    return _connection_payload(new_cfg)
+
+
+@app.delete("/broker/connections/{label}")
+def broker_connection_delete(label: str) -> dict[str, Any]:
+    items = _state.list_connections()
+    if not any(c.label == label for c in items):
+        raise HTTPException(status_code=404, detail=f"connection {label!r} not configured")
+    _state.disconnect_label(label)
+    _state._replace_connections([c for c in items if c.label != label])
+    return {"label": label, "deleted": True}
+
+
+@app.get("/broker/account-aliases")
+def broker_account_aliases() -> dict[str, str]:
+    """Map of `account_id → friendly alias`. Edited via PUT below."""
+    return load_aliases()
+
+
+class AliasPutRequest(BaseModel):
+    aliases: dict[str, str]
+
+
+@app.put("/broker/account-aliases")
+def broker_account_aliases_put(req: AliasPutRequest) -> dict[str, str]:
+    cleaned = {k.strip(): v.strip() for k, v in req.aliases.items() if k and v}
+    save_aliases(cleaned)
+    return cleaned
+
+
+@app.get("/broker/accounts-summary")
+def broker_accounts_summary(connection: str | None = None) -> dict[str, Any]:
+    """One row per IB account across every (or one) connection with the
+    headline financial tags. Used by the Connect page's Accounts table.
+    Aliases applied server-side so the UI doesn't need a second lookup.
+    """
+    targets = _brokers_for_query(connection)
+    aliases = load_aliases()
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for label, b in targets:
+        try:
+            for s in b.get_all_account_summaries():
+                s["connection"] = label
+                s["alias"] = aliases.get(s["account"], "")
+                rows.append(s)
+        except Exception as exc:
+            log.warning("get_all_account_summaries failed for %s: %r", label, exc)
+            errors.append({"connection": label, "error": repr(exc)})
+    return {"accounts": rows, "errors": errors}
+
+
 @app.get("/broker/status")
 def broker_status() -> dict[str, Any]:
-    """Lightweight probe — does the API have IBKR wired up?
+    """Backward-compat status probe.
 
-    The broker is wired up by default; we only return `connected: false`
-    when `IB_BROKER_DISABLED=1` is set. Connection failures (TWS not
-    running, wrong port, etc.) surface as 502 on /broker/account when
-    the user actually tries to use it — there's no point pre-connecting
-    just to render a status badge.
-
-    `accounts` is the full list of managed accounts visible from this
-    connection (populated lazily on first `/broker/account` call); the
-    dashboard uses it to show an account dropdown when more than one
-    account is reachable.
+    Returns the *default* connection's status at the top level (so the
+    existing single-connection dashboard keeps working unchanged), plus
+    a `connections: [...]` array with details for every configured
+    connection — the new multi-connection UI reads from there.
     """
-    b = _state.broker()
-    if b is None:
+    configs = _state.list_connections()
+    if not configs:
         return {
             "connected": False,
             "paper": None,
             "accounts": [],
             "default_account": None,
-            "hint": (
-                "IB broker is disabled. Unset IB_BROKER_DISABLED to enable, "
-                "or set IB_BROKER_HOST / IB_BROKER_PORT / IB_BROKER_CLIENT_ID."
-            ),
+            "hint": "No TWS connections configured. Edit data_cache/connections.json.",
+            "connections": [],
         }
-    return {
-        "connected": True,
-        "paper": b.paper,
-        "account": b.account,                 # legacy alias for default_account
-        "default_account": b.default_account,
-        "accounts": b.accounts,
+    b = _state.broker()  # default
+    payload: dict[str, Any] = {
+        "connected": False,
+        "paper": configs[0].paper,
+        "account": None,
+        "default_account": None,
+        "accounts": [],
         "hint": None,
+        "connections": [_connection_payload(c) for c in configs],
     }
+    if b is not None:
+        try:
+            payload["paper"] = b.paper
+            payload["account"] = b.account
+            payload["default_account"] = b.default_account
+            payload["accounts"] = b.accounts
+            payload["connected"] = True
+        except Exception:
+            pass
+    return payload
 
 
 @app.get("/broker/account")
-def broker_account() -> dict[str, Any]:
-    b = _state.broker()
+def broker_account(connection: str | None = None) -> dict[str, Any]:
+    """Account snapshot. Pass `?connection=label` to target a specific
+    connection; otherwise the *default* connection's account is returned
+    (matches single-connection legacy behavior). Use `/broker/connections`
+    to enumerate available connections."""
+    b = _state.broker(connection)
     if b is None:
-        raise HTTPException(status_code=503, detail="Broker not configured")
+        raise HTTPException(
+            status_code=503,
+            detail=f"connection {connection!r} unavailable" if connection else "Broker not configured",
+        )
     try:
-        return b.get_account().to_dict()
+        snap = b.get_account().to_dict()
     except Exception as exc:
-        log.exception("IB get_account failed")
+        log.exception("IB get_account failed for %s", connection or "default")
         raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+    snap["connection"] = connection or _state._resolve_label(None)
+    return snap
 
 
 @app.get("/broker/positions")
-def broker_positions() -> dict[str, Any]:
-    b = _state.broker()
-    if b is None:
-        raise HTTPException(status_code=503, detail="Broker not configured")
-    try:
-        positions = b.get_positions()
-    except Exception as exc:
-        log.exception("IB get_positions failed")
-        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
-    return {"positions": [p.to_dict() for p in positions]}
+def broker_positions(connection: str | None = None) -> dict[str, Any]:
+    """Open positions. Without `?connection=`, aggregates across every
+    instantiated broker — each row is tagged with its source `connection`
+    so the UI can group/filter."""
+    targets = _brokers_for_query(connection)
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for label, b in targets:
+        try:
+            for p in b.get_positions():
+                d = p.to_dict()
+                d["connection"] = label
+                rows.append(d)
+        except Exception as exc:
+            log.warning("get_positions failed for %s: %r", label, exc)
+            errors.append({"connection": label, "error": repr(exc)})
+    return {"positions": rows, "errors": errors}
+
+
+def _brokers_for_query(connection: str | None) -> list[tuple[str, IBBroker]]:
+    """Resolve the target list for read endpoints. With an explicit
+    connection: just that one (errors if unknown). Without: every
+    instantiated broker."""
+    if connection is not None:
+        b = _state.broker(connection)
+        if b is None:
+            raise HTTPException(status_code=404, detail=f"connection {connection!r} unavailable")
+        return [(connection, b)]
+    # Eager-instantiate so a fresh process answers correctly without
+    # requiring a prior per-connection request.
+    _state.eager_init_auto_connect()
+    out = _state.all_brokers()
+    if not out:
+        raise HTTPException(status_code=503, detail="No connections configured")
+    return out
 
 
 @app.post("/broker/close-all")
-def broker_close_all() -> dict[str, Any]:
-    """Kill switch — submit market closes for every open position."""
-    b = _state.broker()
-    if b is None:
-        raise HTTPException(status_code=503, detail="Broker not configured")
-    try:
-        result = b.close_all_positions(cancel_orders=True)
-    except Exception as exc:
-        log.exception("IB close_all_positions failed")
-        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+def broker_close_all(connection: str | None = None) -> dict[str, Any]:
+    """Kill switch. Without `?connection=`, fans out to every connection;
+    with one, scopes to that connection only."""
+    targets = _brokers_for_query(connection)
+    submitted = ok = failed = 0
+    details: list[dict[str, Any]] = []
+    for label, b in targets:
+        try:
+            r = b.close_all_positions(cancel_orders=True)
+            submitted += int(r.get("submitted", 0))
+            ok += int(r.get("ok", 0))
+            failed += int(r.get("failed", 0))
+            for d in r.get("details", []):
+                d["connection"] = label
+                details.append(d)
+        except Exception as exc:
+            log.exception("close_all_positions failed for %s", label)
+            failed += 1
+            details.append({"connection": label, "error": repr(exc), "ok": False})
     log.warning(
-        "Kill switch fired — submitted=%d ok=%d failed=%d",
-        result["submitted"], result["ok"], result["failed"],
+        "Kill switch fired — submitted=%d ok=%d failed=%d across %d connection(s)",
+        submitted, ok, failed, len(targets),
     )
-    return result
+    return {"submitted": submitted, "ok": ok, "failed": failed, "details": details}
+
+
+def _resolve_targets(req: OrderRequest) -> list[OrderTarget]:
+    """Normalize the order's destination list.
+
+    Three caller shapes accepted:
+      1) `targets=[OrderTarget(...), ...]` (preferred, multi-target)
+      2) legacy `connection`/`account` top-level fields  → single target
+      3) neither → one target with both fields None (default conn / account)
+    """
+    if req.targets:
+        return list(req.targets)
+    if req.connection is not None or req.account is not None:
+        return [OrderTarget(connection=req.connection, account=req.account)]
+    return [OrderTarget(connection=None, account=None)]
 
 
 @app.post("/broker/orders")
 def broker_submit_order(req: OrderRequest) -> dict[str, Any]:
-    """Place a new order. Logs every attempt at INFO."""
-    b = _state.broker()
-    if b is None:
-        raise HTTPException(status_code=503, detail="Broker not configured")
-
+    """Place a new order. With `targets=[{connection,account}, ...]` the
+    server fans out one IB placeOrder per target and returns the list.
+    Single-target legacy callers (no `targets`, no `connection`) still
+    work and get back a one-element list under the same `orders` key.
+    """
     side = req.side.lower()
     if side not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
@@ -621,43 +1019,82 @@ def broker_submit_order(req: OrderRequest) -> dict[str, Any]:
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
 
-    log.info(
-        "Submitting order: paper=%s account=%s %s %s qty=%s type=%s tif=%s "
-        "limit=%s stop=%s planned_stop=%s score=%s peg_offset=%s cap_price=%s",
-        b.paper, req.account or b.default_account, side, symbol,
-        req.qty, req.type, req.time_in_force,
-        req.limit_price, req.stop_price,
-        req.planned_stop, req.score_at_entry,
-        req.peg_offset, req.cap_price,
-    )
-    try:
-        order = b.submit_order(
-            symbol=symbol,
-            qty=req.qty,
-            side=side,
-            order_type=req.type,
-            time_in_force=req.time_in_force,
-            limit_price=req.limit_price,
-            stop_price=req.stop_price,
-            client_order_id=req.client_order_id,
-            planned_stop=req.planned_stop,
-            score_at_entry=req.score_at_entry,
-            peg_offset=req.peg_offset,
-            cap_price=req.cap_price,
-            account=req.account,
+    targets = _resolve_targets(req)
+    if not targets:
+        raise HTTPException(status_code=400, detail="targets cannot be empty")
+
+    placed: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for tgt in targets:
+        # Prefer the explicit connection; otherwise infer from the
+        # account if given (so legacy callers passing just `account`
+        # auto-route to the right TWS); else default connection.
+        label = tgt.connection
+        if label is None and tgt.account:
+            label = _state.account_to_label(tgt.account)
+        b = _state.broker(label)
+        if b is None:
+            failures.append({
+                "connection": label,
+                "account": tgt.account,
+                "error": f"connection {label!r} unavailable",
+            })
+            continue
+
+        log.info(
+            "Submitting order: conn=%s account=%s paper=%s %s %s qty=%s type=%s tif=%s "
+            "limit=%s stop=%s planned_stop=%s score=%s peg_offset=%s cap_price=%s",
+            label, tgt.account or b.default_account, b.paper, side, symbol,
+            req.qty, req.type, req.time_in_force,
+            req.limit_price, req.stop_price,
+            req.planned_stop, req.score_at_entry,
+            req.peg_offset, req.cap_price,
         )
-    except KillSwitchActive as exc:
-        raise HTTPException(
-            status_code=423,
-            detail=str(exc),
-            headers={"X-Risk-Locked": "daily_drawdown"},
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        log.exception("IB submit_order failed")
-        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
-    return order.to_dict()
+        try:
+            order = b.submit_order(
+                symbol=symbol,
+                qty=req.qty,
+                side=side,
+                order_type=req.type,
+                time_in_force=req.time_in_force,
+                limit_price=req.limit_price,
+                stop_price=req.stop_price,
+                client_order_id=req.client_order_id,
+                planned_stop=req.planned_stop,
+                score_at_entry=req.score_at_entry,
+                peg_offset=req.peg_offset,
+                cap_price=req.cap_price,
+                account=tgt.account,
+            )
+        except KillSwitchActive as exc:
+            # Hard-fail the whole batch — one connection's circuit breaker
+            # firing means we shouldn't quietly half-place a multi-target order.
+            raise HTTPException(
+                status_code=423,
+                detail=str(exc),
+                headers={"X-Risk-Locked": "daily_drawdown"},
+            ) from exc
+        except ValueError as exc:
+            failures.append({
+                "connection": label, "account": tgt.account, "error": str(exc),
+            })
+            continue
+        except Exception as exc:
+            log.exception("IB submit_order failed for %s/%s", label, tgt.account)
+            failures.append({
+                "connection": label, "account": tgt.account, "error": repr(exc),
+            })
+            continue
+
+        d = order.to_dict()
+        d["connection"] = label
+        placed.append(d)
+
+    # Some succeeded, some failed → 207-style payload (still 200 OK so
+    # the UI can show what worked). All failed → 502 so the UI flags it.
+    if not placed and failures:
+        raise HTTPException(status_code=502, detail={"orders": placed, "failures": failures})
+    return {"orders": placed, "failures": failures}
 
 
 @app.delete("/broker/positions/{symbol}")
@@ -666,21 +1103,26 @@ def broker_close_position(
     percentage: float | None = None,
     qty: float | None = None,
     account: str | None = None,
+    connection: str | None = None,
 ) -> dict[str, Any]:
     """Close a single position fully or partially.
 
-    Pass `?percentage=50` for a 50% close, `?qty=5` for a 5-share close,
-    or neither for a full close. `?account=DUxxxxxx` to target a
-    non-default account.
+    `?percentage=50` for a 50% close, `?qty=5` for a 5-share close, or
+    neither for a full close. `?account=` targets a specific account;
+    `?connection=` targets a specific connection (auto-resolved from
+    `account` if omitted).
     """
-    b = _state.broker()
+    label = connection
+    if label is None and account:
+        label = _state.account_to_label(account)
+    b = _state.broker(label)
     if b is None:
         raise HTTPException(status_code=503, detail="Broker not configured")
 
     sym = symbol.strip().upper()
     log.info(
-        "Close position: paper=%s account=%s symbol=%s qty=%s percentage=%s",
-        b.paper, account or b.default_account, sym, qty, percentage,
+        "Close position: conn=%s paper=%s account=%s symbol=%s qty=%s percentage=%s",
+        label, b.paper, account or b.default_account, sym, qty, percentage,
     )
     try:
         order = b.close_position(sym, qty=qty, percentage=percentage, account=account)
@@ -695,41 +1137,63 @@ def broker_close_position(
     except Exception as exc:
         log.exception("IB close_position failed")
         raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
-    return order.to_dict()
+    d = order.to_dict()
+    d["connection"] = label or _state._resolve_label(None)
+    return d
 
 
 @app.delete("/broker/orders")
-def broker_cancel_orders(symbol: str) -> dict[str, Any]:
-    """Cancel every still-working order for one symbol. Used by the
-    dashboard's per-ticker "Cancel" button. Pass `?symbol=AAPL`."""
-    b = _state.broker()
-    if b is None:
-        raise HTTPException(status_code=503, detail="Broker not configured")
+def broker_cancel_orders(symbol: str, connection: str | None = None) -> dict[str, Any]:
+    """Cancel every still-working order for one symbol. With
+    `?connection=`, scopes to that connection; otherwise broadcasts to
+    every connection (orders only on the originating client are
+    cancelled — orders from other connections will be left intact)."""
     sym = symbol.strip().upper()
     if not sym:
         raise HTTPException(status_code=400, detail="symbol is required")
-    log.info("Cancel orders for symbol: %s", sym)
-    try:
-        return b.cancel_orders_for_symbol(sym)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        log.exception("IB cancel_orders_for_symbol failed")
-        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
+    targets = _brokers_for_query(connection)
+    log.info("Cancel orders for symbol: %s across %d connection(s)", sym, len(targets))
+    aggregated: list[dict[str, Any]] = []
+    for label, b in targets:
+        try:
+            r = b.cancel_orders_for_symbol(sym)
+            r["connection"] = label
+            aggregated.append(r)
+        except Exception as exc:
+            log.exception("cancel_orders_for_symbol failed for %s", label)
+            aggregated.append({"connection": label, "error": repr(exc), "canceled": 0})
+    total = sum(int(r.get("canceled", 0)) for r in aggregated)
+    return {"symbol": sym, "canceled": total, "results": aggregated}
 
 
 @app.get("/broker/orders")
-def broker_get_orders(limit: int = 30, status: str = "all") -> dict[str, Any]:
-    b = _state.broker()
-    if b is None:
-        raise HTTPException(status_code=503, detail="Broker not configured")
+def broker_get_orders(
+    limit: int = 30,
+    status: str = "all",
+    connection: str | None = None,
+) -> dict[str, Any]:
+    """Recent orders. Without `?connection=`, aggregates across every
+    instantiated broker — each row is tagged with its source `connection`."""
+    targets = _brokers_for_query(connection)
     capped_limit = max(1, min(limit, 200))
-    try:
-        orders = b.get_orders(limit=capped_limit, status=status)
-    except Exception as exc:
-        log.exception("IB get_orders failed")
-        raise HTTPException(status_code=502, detail=f"IB: {exc!r}") from exc
-    return {"orders": [o.to_dict() for o in orders]}
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for label, b in targets:
+        try:
+            for o in b.get_orders(limit=capped_limit, status=status):
+                d = o.to_dict()
+                d["connection"] = label
+                rows.append(d)
+        except Exception as exc:
+            log.warning("get_orders failed for %s: %r", label, exc)
+            errors.append({"connection": label, "error": repr(exc)})
+    # Most-recent first across the union; broker.get_orders already
+    # returns reverse-chronological per connection, so a sort by
+    # submitted_at is a stable interleave.
+    rows.sort(key=lambda r: r.get("submitted_at") or "", reverse=True)
+    if connection is None:
+        rows = rows[:capped_limit]
+    return {"orders": rows, "errors": errors}
 
 
 # ----------------------------------------------------------------------
@@ -756,41 +1220,109 @@ _SSE_HEARTBEAT_SEC = 15.0
 
 
 @app.get("/broker/stream")
-async def broker_stream() -> StreamingResponse:
+async def broker_stream(connection: str | None = None) -> StreamingResponse:
     """Server-sent events: pushes account / position / order / fill /
-    risk deltas as ib_async events fire. The frontend subscribes on
-    mount and stops polling. Initial `event: snapshot` carries the
-    current cache so reconnecting clients don't need a separate REST
-    round-trip.
-    """
-    b = _state.broker()
-    if b is None:
-        raise HTTPException(status_code=503, detail="Broker not configured")
+    risk deltas as ib_async events fire across **every** instantiated
+    broker (or one, with `?connection=`). Each event carries a
+    `connection` field so the UI knows which TWS it came from.
 
-    # Force a connect so reqAccountUpdates is wired and events flow.
-    # `get_account` is idempotent — subsequent calls are cheap.
-    try:
-        await asyncio.to_thread(b.get_account)
-    except Exception as exc:
-        log.warning("Broker connect failed before SSE stream: %r", exc)
+    The initial `event: snapshot` carries one snapshot per active
+    connection in `{label: snapshot}` form so a reconnecting client can
+    rebuild full multi-connection state in one round trip.
+    """
+    if connection is not None:
+        b = _state.broker(connection)
+        if b is None:
+            raise HTTPException(status_code=503, detail=f"connection {connection!r} unavailable")
+        targets = [(connection, b)]
+    else:
+        _state.eager_init_auto_connect()
+        targets = _state.all_brokers()
+        if not targets:
+            raise HTTPException(status_code=503, detail="No connections configured")
+
+    # Force a connect on each target so reqAccountUpdates is wired and
+    # events flow. Run in parallel with a hard cap — one slow/failing
+    # TWS shouldn't keep the SSE stream from opening for the others.
+    async def _probe(label: str, b: IBBroker) -> None:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(b.get_account), timeout=2.0)
+        except Exception as exc:
+            log.warning("SSE pre-connect failed for %s: %r", label, exc)
+
+    if targets:
+        await asyncio.gather(*(_probe(label, b) for label, b in targets))
 
     loop = asyncio.get_running_loop()
-    queue, sub_id = b.state.subscribe(loop)
-    snapshot = b.state.snapshot()
+    # Per-connection (queue, sub_id) so we can clean up in finally.
+    subs: list[tuple[str, asyncio.Queue, int, Any]] = []
+    per_conn_snaps: dict[str, Any] = {}
+    for label, b in targets:
+        queue, sub_id = b.state.subscribe(loop)
+        subs.append((label, queue, sub_id, b))
+        snap = b.state.snapshot()
+        # Tag each position/order row in the snapshot with its source
+        # connection so the UI can key state by `(connection, account, …)`
+        # without a separate lookup. BrokerState doesn't know its own
+        # label, so the SSE layer is the right place to do this.
+        for p in snap.get("positions", []):
+            if isinstance(p, dict) and "connection" not in p:
+                p["connection"] = label
+        for o in snap.get("orders", []):
+            if isinstance(o, dict) and "connection" not in o:
+                o["connection"] = label
+        per_conn_snaps[label] = snap
+
+    # Backward-compatible snapshot envelope: top-level keys mirror the
+    # default connection's snapshot (so legacy single-connection clients
+    # see the same shape they always did), with a `connections: {label:
+    # snap}` map alongside for multi-connection-aware UIs.
+    default_label = _state._resolve_label(None) or ""
+    default_snap = per_conn_snaps.get(default_label, {})
+    snapshot_payload = {**default_snap, "connections": per_conn_snaps}
 
     async def event_gen() -> AsyncIterator[str]:
+        # Fan-in: one task per source queue draining into a shared queue.
+        merged: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=1024)
+
+        async def drain(label: str, q: asyncio.Queue) -> None:
+            while True:
+                ev = await q.get()
+                await merged.put((label, ev))
+
+        drain_tasks = [asyncio.create_task(drain(label, q)) for label, q, _, _ in subs]
         try:
-            yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
+            yield f"event: snapshot\ndata: {json.dumps(snapshot_payload)}\n\n"
             while True:
                 try:
-                    ev = await asyncio.wait_for(
-                        queue.get(), timeout=_SSE_HEARTBEAT_SEC
+                    label, ev = await asyncio.wait_for(
+                        merged.get(), timeout=_SSE_HEARTBEAT_SEC
                     )
+                    # Tag the event so the UI can route it to the right
+                    # row. We tag both at the top level (`ev.connection`)
+                    # and inside the payload (`ev.payload.connection`)
+                    # so consumers can key state by `(connection, …)`
+                    # without a separate lookup either way.
+                    if isinstance(ev, dict):
+                        payload = ev.get("payload")
+                        if isinstance(payload, dict) and "connection" not in payload:
+                            payload = {**payload, "connection": label}
+                            ev = {**ev, "payload": payload, "connection": label}
+                        else:
+                            ev = {**ev, "connection": label}
+                    else:
+                        ev = {"connection": label, "payload": ev}
                     yield f"data: {json.dumps(ev)}\n\n"
                 except asyncio.TimeoutError:
                     yield ": heartbeat\n\n"
         finally:
-            b.state.unsubscribe(sub_id)
+            for t in drain_tasks:
+                t.cancel()
+            for label, _, sub_id, b in subs:
+                try:
+                    b.state.unsubscribe(sub_id)
+                except Exception:
+                    log.debug("unsubscribe failed for %s", label, exc_info=True)
 
     return StreamingResponse(
         event_gen(),

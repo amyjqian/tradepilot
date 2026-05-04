@@ -110,6 +110,10 @@ class Position:
     unrealized_pl_abs: float
     unrealized_pl_pct: float
     side: str  # "long" / "short"
+    # IB account holding this position. Required for multi-account
+    # disambiguation — the same symbol can be held in multiple accounts
+    # on the same TWS connection, and they must not collide in caches.
+    account: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +126,7 @@ class Position:
             "unrealized_pl_abs": round(self.unrealized_pl_abs, 2),
             "unrealized_pl_pct": round(self.unrealized_pl_pct, 4),
             "side": self.side,
+            "account": self.account,
         }
 
 
@@ -141,6 +146,10 @@ class OrderRecord:
     submitted_at: str | None
     filled_at: str | None
     filled_avg_price: float | None
+    # IB account this order routed to. Same disambiguation reason as
+    # Position.account — order ids are unique only per IB client, not
+    # per (connection, account).
+    account: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -157,6 +166,7 @@ class OrderRecord:
             "status": self.status,
             "submitted_at": self.submitted_at,
             "filled_at": self.filled_at,
+            "account": self.account,
             "filled_avg_price": (
                 round(self.filled_avg_price, 4)
                 if self.filled_avg_price is not None
@@ -504,8 +514,10 @@ class IBBroker:
             upl_abs = _f(getattr(item, "unrealizedPNL", mkt_value - cost_basis))
             upl_pct = (upl_abs / cost_basis * 100.0) if cost_basis else 0.0
             symbol = str(getattr(contract, "symbol", "") or "").upper()
+            account = str(getattr(item, "account", "") or "")
             payload = {
                 "symbol": symbol,
+                "account": account,
                 "qty": qty,
                 "avg_entry_price": round(avg, 4),
                 "current_price": round(mkt, 4),
@@ -781,9 +793,56 @@ class IBBroker:
             status="ACTIVE" if equity > 0 or cash > 0 else "EMPTY",
         )
 
+    async def _async_get_all_account_summaries(self) -> list[dict[str, Any]]:
+        """One row per account on this connection with the headline
+        financial tags.
+
+        IB's `accountSummary("All")` returns aggregated values, not
+        per-account ones, so we loop over each managed account. That's
+        N round-trips per refresh — fine at 1–10 accounts; if we ever
+        need to scale further, switch to subscribing once via
+        `reqAccountSummary` and pushing updates through SSE instead.
+        """
+        ib = await self._async_connect()
+        out: list[dict[str, Any]] = []
+        for acct in self._managed_accounts:
+            values = await ib.accountSummaryAsync(acct)
+            tags: dict[str, str] = {}
+            for v in values or []:
+                # Filter to the queried account — IB sometimes mixes
+                # other-account rows in the response when a master/
+                # advisor relationship is set.
+                if str(getattr(v, "account", "") or "") not in (acct, ""):
+                    continue
+                tag = str(getattr(v, "tag", "") or "")
+                if tag:
+                    tags[tag] = str(getattr(v, "value", "") or "")
+            equity = _f(tags.get("NetLiquidation"))
+            cash = _f(tags.get("TotalCashValue"))
+            excess = _f(tags.get("ExcessLiquidity"))
+            realized = _f(tags.get("RealizedPnL"))
+            unrealized = _f(tags.get("UnrealizedPnL"))
+            paper = acct.startswith("D") or self.paper
+            out.append({
+                "account": acct,
+                "paper": paper,
+                "net_liquidation": equity,
+                "total_cash": cash,
+                "excess_liquidity": excess,
+                "realized_pnl": realized,
+                "unrealized_pnl": unrealized,
+                "daily_pnl": realized + unrealized,
+            })
+        return out
+
+    def get_all_account_summaries(self) -> list[dict[str, Any]]:
+        return self._submit(self._async_get_all_account_summaries())
+
     async def _async_get_positions(self) -> list[Position]:
         ib = await self._async_connect()
-        rows = ib.positions(self._account or "")
+        # Empty string asks for *every* managed account on this client,
+        # which is what we want for the multi-account dashboard.
+        rows = ib.positions("")
         out: list[Position] = []
         for p in rows:
             qty = float(getattr(p, "position", 0))
@@ -792,12 +851,13 @@ class IBBroker:
             avg = float(getattr(p, "avgCost", 0.0))
             contract = getattr(p, "contract", None)
             symbol = str(getattr(contract, "symbol", "") or "")
+            account = str(getattr(p, "account", "") or "")
             # IB doesn't put current price on Position; fall back to
             # marketPrice from the portfolio view if available, else use
             # avg cost (best we can do without a quote subscription).
             current_price = avg
             try:
-                portfolio = ib.portfolio(self._account or "")
+                portfolio = ib.portfolio(account or "")
                 for item in portfolio:
                     if getattr(item, "contract", None) is contract or (
                         contract is not None
@@ -824,6 +884,7 @@ class IBBroker:
                     unrealized_pl_abs=upl_abs,
                     unrealized_pl_pct=upl_pct,
                     side="long" if qty > 0 else "short",
+                    account=account,
                 )
             )
         return out
@@ -1130,6 +1191,7 @@ def _trade_to_record(trade: Any) -> OrderRecord:
         submitted_at=_iso(submitted_at),
         filled_at=_iso(filled_at),
         filled_avg_price=avg_fill,
+        account=str(getattr(order, "account", "") or ""),
     )
 
 

@@ -4,7 +4,9 @@ import { closePosition } from '../api'
 import type {
   BrokerPosition,
   BrokerStatus,
+  ConnectionInfo,
   OrderRecord,
+  OrderTarget,
   ScanResult,
 } from '../types'
 import { fmtCurrency, fmtPct } from '../format'
@@ -19,6 +21,9 @@ interface Props {
   accounts: string[]
   selectedAccount: string | null
   onSelectAccount: (acct: string | null) => void
+  connections: ConnectionInfo[]
+  selectedTargets: OrderTarget[]
+  onSelectTargets: (targets: OrderTarget[]) => void
   liveAcknowledged: boolean
   onLiveConfirmRequested: (onApprove: () => void) => void
   onPickPosition: (p: BrokerPosition) => void
@@ -34,6 +39,9 @@ export function RightRail({
   accounts,
   selectedAccount,
   onSelectAccount,
+  connections,
+  selectedTargets,
+  onSelectTargets,
   liveAcknowledged,
   onLiveConfirmRequested,
   onPickPosition,
@@ -75,6 +83,9 @@ export function RightRail({
                 accounts={accounts}
                 selectedAccount={selectedAccount}
                 onSelectAccount={onSelectAccount}
+                connections={connections}
+                selectedTargets={selectedTargets}
+                onSelectTargets={onSelectTargets}
                 liveAcknowledged={liveAcknowledged}
                 onLiveConfirmRequested={onLiveConfirmRequested}
                 positions={positions}

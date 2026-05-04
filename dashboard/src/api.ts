@@ -1,10 +1,12 @@
 import type {
   AccountSnapshot,
+  AccountSummaryRow,
   BacktestParams,
   BacktestReport,
   BrokerPosition,
   BrokerStatus,
   CloseAllResult,
+  ConnectionInfo,
   JournalStats,
   JournalTrade,
   OrderRecord,
@@ -12,6 +14,7 @@ import type {
   ScanResponse,
   SectorRotationResponse,
   SubmitOrderRequest,
+  SubmitOrderResponse,
 } from './types'
 
 export const BASE_URL = import.meta.env.VITE_API_BASE ?? 'http://localhost:8787'
@@ -144,7 +147,129 @@ export async function closeAllPositions(): Promise<CloseAllResult> {
   return res.json() as Promise<CloseAllResult>
 }
 
-export async function submitOrder(req: SubmitOrderRequest): Promise<OrderRecord> {
+export async function fetchConnections(): Promise<ConnectionInfo[]> {
+  const res = await fetch(`${BASE_URL}/broker/connections`)
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`connections fetch failed: ${res.status} ${text}`)
+  }
+  const data = (await res.json()) as { connections: ConnectionInfo[] }
+  return data.connections
+}
+
+export async function connectBroker(label: string): Promise<ConnectionInfo> {
+  const res = await fetch(
+    `${BASE_URL}/broker/connections/${encodeURIComponent(label)}/connect`,
+    { method: 'POST' },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`connect ${label} failed: ${res.status} ${text}`)
+  }
+  return res.json() as Promise<ConnectionInfo>
+}
+
+export async function disconnectBroker(label: string): Promise<ConnectionInfo> {
+  const res = await fetch(
+    `${BASE_URL}/broker/connections/${encodeURIComponent(label)}/disconnect`,
+    { method: 'POST' },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`disconnect ${label} failed: ${res.status} ${text}`)
+  }
+  return res.json() as Promise<ConnectionInfo>
+}
+
+export interface ConnectionUpsert {
+  label: string
+  host: string
+  port: number
+  client_id: number
+  paper: boolean
+  auto_connect: boolean
+  default_account?: string | null
+}
+
+export async function createConnection(req: ConnectionUpsert): Promise<ConnectionInfo> {
+  const res = await fetch(`${BASE_URL}/broker/connections`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`create connection failed: ${res.status} ${text}`)
+  }
+  return res.json() as Promise<ConnectionInfo>
+}
+
+export async function updateConnection(
+  oldLabel: string,
+  req: ConnectionUpsert,
+): Promise<ConnectionInfo> {
+  const res = await fetch(
+    `${BASE_URL}/broker/connections/${encodeURIComponent(oldLabel)}`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(req),
+    },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`update connection failed: ${res.status} ${text}`)
+  }
+  return res.json() as Promise<ConnectionInfo>
+}
+
+export async function deleteConnection(label: string): Promise<void> {
+  const res = await fetch(
+    `${BASE_URL}/broker/connections/${encodeURIComponent(label)}`,
+    { method: 'DELETE' },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`delete connection failed: ${res.status} ${text}`)
+  }
+}
+
+export async function fetchAccountAliases(): Promise<Record<string, string>> {
+  const res = await fetch(`${BASE_URL}/broker/account-aliases`)
+  if (!res.ok) throw new Error(`fetch aliases failed: ${res.status}`)
+  return res.json() as Promise<Record<string, string>>
+}
+
+export async function saveAccountAliases(
+  aliases: Record<string, string>,
+): Promise<Record<string, string>> {
+  const res = await fetch(`${BASE_URL}/broker/account-aliases`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ aliases }),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`save aliases failed: ${res.status} ${text}`)
+  }
+  return res.json() as Promise<Record<string, string>>
+}
+
+export async function fetchAccountsSummary(
+  connection?: string,
+): Promise<{ accounts: AccountSummaryRow[]; errors: { connection: string; error: string }[] }> {
+  const url = connection
+    ? `${BASE_URL}/broker/accounts-summary?connection=${encodeURIComponent(connection)}`
+    : `${BASE_URL}/broker/accounts-summary`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`accounts-summary failed: ${res.status}`)
+  return res.json() as Promise<{
+    accounts: AccountSummaryRow[]
+    errors: { connection: string; error: string }[]
+  }>
+}
+
+export async function submitOrder(req: SubmitOrderRequest): Promise<SubmitOrderResponse> {
   const res = await fetch(`${BASE_URL}/broker/orders`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -154,17 +279,23 @@ export async function submitOrder(req: SubmitOrderRequest): Promise<OrderRecord>
     const text = await res.text().catch(() => '')
     throw new Error(`submit order failed: ${res.status} ${text}`)
   }
-  return res.json() as Promise<OrderRecord>
+  return res.json() as Promise<SubmitOrderResponse>
 }
 
 export async function closePosition(
   symbol: string,
-  options: { percentage?: number; qty?: number; account?: string | null } = {},
+  options: {
+    percentage?: number
+    qty?: number
+    account?: string | null
+    connection?: string | null
+  } = {},
 ): Promise<OrderRecord> {
   const params = new URLSearchParams()
   if (options.percentage !== undefined) params.set('percentage', String(options.percentage))
   if (options.qty !== undefined) params.set('qty', String(options.qty))
   if (options.account) params.set('account', options.account)
+  if (options.connection) params.set('connection', options.connection)
   const qs = params.toString() ? `?${params.toString()}` : ''
   const res = await fetch(
     `${BASE_URL}/broker/positions/${encodeURIComponent(symbol)}${qs}`,
@@ -179,16 +310,19 @@ export async function closePosition(
 
 export async function cancelOrdersForSymbol(
   symbol: string,
-): Promise<{ symbol: string; canceled: number; order_ids: number[] }> {
+  connection?: string | null,
+): Promise<{ symbol: string; canceled: number; results?: unknown[] }> {
+  const params = new URLSearchParams({ symbol })
+  if (connection) params.set('connection', connection)
   const res = await fetch(
-    `${BASE_URL}/broker/orders?symbol=${encodeURIComponent(symbol)}`,
+    `${BASE_URL}/broker/orders?${params.toString()}`,
     { method: 'DELETE' },
   )
   if (!res.ok) {
     const text = await res.text().catch(() => '')
     throw new Error(`cancel orders failed: ${res.status} ${text}`)
   }
-  return res.json() as Promise<{ symbol: string; canceled: number; order_ids: number[] }>
+  return res.json() as Promise<{ symbol: string; canceled: number; results?: unknown[] }>
 }
 
 export async function fetchOrders(limit = 30): Promise<OrderRecord[]> {
