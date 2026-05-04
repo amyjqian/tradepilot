@@ -46,6 +46,7 @@ import httpx
 import pandas as pd
 
 from scanner.data.base import OHLCV_COLUMNS, MarketDataProvider, validate_bars
+from scanner.diagnostics import Warning, warnings as _warning_bus
 
 log = logging.getLogger(__name__)
 
@@ -289,6 +290,27 @@ class PolygonProvider(MarketDataProvider):
                 )
             if resp.status_code == 429:
                 last_retry_after = float(resp.headers.get("Retry-After", "1") or 1)
+                # Surface to the dashboard regardless of whether we end
+                # up retrying successfully — the user wants to see when
+                # we're hitting the per-minute ceiling so they can
+                # tune POLYGON_RATE_LIMIT_PER_MIN or upgrade the plan.
+                _warning_bus.publish(
+                    Warning(
+                        kind="polygon_rate_limit",
+                        message=(
+                            f"Polygon rate limit hit for {ticker} "
+                            f"(retry after {last_retry_after:.1f}s, "
+                            f"attempt {attempt + 1}/{self._cfg.max_retries + 1})"
+                        ),
+                        detail={
+                            "ticker": ticker,
+                            "retry_after_sec": last_retry_after,
+                            "attempt": attempt + 1,
+                            "max_attempts": self._cfg.max_retries + 1,
+                            "rate_limit_per_min": self._cfg.rate_limit_per_min,
+                        },
+                    )
+                )
                 if attempt >= self._cfg.max_retries:
                     raise PolygonRateLimited(
                         f"Polygon rate-limited after {self._cfg.max_retries + 1} attempts",

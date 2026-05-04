@@ -8,6 +8,7 @@ import { RightRail } from './components/RightRail'
 import { LiveConfirmModal } from './components/LiveConfirmModal'
 import { ResizeHandle } from './components/ResizeHandle'
 import { ConnectView } from './components/ConnectView'
+import { WarningToasts } from './components/WarningToasts'
 import { useBrokerData } from './useBrokerData'
 
 type AppView = 'trade' | 'connect'
@@ -176,6 +177,8 @@ export default function App() {
       {livePendingApprove && (
         <LiveConfirmModal onApprove={onLiveApproved} onCancel={onLiveCanceled} />
       )}
+
+      <WarningToasts />
     </div>
   )
 }

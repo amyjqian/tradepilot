@@ -37,6 +37,7 @@ from scanner.broker.connections import (
 from scanner.config import ScannerConfig
 from scanner.data import MarketDataProvider, get_provider
 from scanner.data.ib_provider import PacingBudgetExhausted
+from scanner.diagnostics import warnings as _warning_bus
 from scanner.engine import scan
 from scanner.sector_rotation import (
     SECTOR_ETFS,
@@ -386,6 +387,46 @@ class OrderRequest(BaseModel):
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/warnings/recent")
+def warnings_recent() -> dict[str, Any]:
+    """Latest non-fatal warnings (Polygon 429s, IB pacing exhaustion,
+    etc.). The dashboard subscribes to /warnings/stream for live
+    updates; this is a fallback for clients that prefer polling."""
+    return {"warnings": _warning_bus.recent()}
+
+
+@app.get("/warnings/stream")
+async def warnings_stream() -> StreamingResponse:
+    """Server-sent events stream of non-fatal warnings. Sends an
+    initial `event: snapshot` with the recent ring buffer so the UI
+    can backfill any warnings the user missed before opening the tab,
+    then pushes each new warning as a `data:` event."""
+    loop = asyncio.get_running_loop()
+    queue, sub_id = _warning_bus.subscribe(loop)
+    snapshot = _warning_bus.recent()
+
+    async def event_gen() -> AsyncIterator[str]:
+        try:
+            yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
+            while True:
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(ev)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            _warning_bus.unsubscribe(sub_id)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/config")
