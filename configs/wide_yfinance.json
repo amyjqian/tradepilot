@@ -1,8 +1,7 @@
 {
-  "_comment": "Wide 100-ticker universe for pre-market / overnight scans on yfinance. yfinance batches the whole list into one HTTP call, so 100 tickers costs the same as 10. Use interval=1d for EOD screens, or 5m/15m with the understanding that yfinance bars are ~15 min delayed — fine for building a watchlist, not for live entries. Do NOT use with IBKR (would take ~20s and eat the 10-min pacing budget).",
+  "_comment": "Wide 100-ticker universe for pre-market / overnight scans. Filename retained for backward compat — equally usable on Polygon (preferred for live data; per-ticker REST batched at max_concurrency=16) or yfinance (single batched HTTP call, but bars are ~15 min delayed — watchlist-building only). Do NOT run on IB at this universe size; would exhaust the 10-min pacing budget.",
   "universe": {
     "min_price": 3.0,
-    "max_price": 2000.0,
     "min_avg_volume": 200000,
     "min_dollar_volume": 5000000
   },

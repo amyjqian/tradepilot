@@ -1,8 +1,7 @@
 {
-  "_comment": "Preset for 1-minute intraday scalping via IBKR. IB caps 1-min requests at 1 day of history per request, so lookback_days=1 is the max you can fetch in one call. Per-bar volume floors are 1/5 of the 5m preset.",
+  "_comment": "Preset for 1-minute intraday scalping. Per-bar volume floors are ~1/5 of the 5m preset since each bar is 1/5 the duration. lookback_days defaults to 1 here for IB compatibility (it caps 1-min at 1 day per request); on Polygon you can safely raise this — the dashboard already uses 5 days by default.",
   "universe": {
     "min_price": 5.0,
-    "max_price": 1000.0,
     "min_avg_volume": 8000,
     "min_dollar_volume": 500000
   },

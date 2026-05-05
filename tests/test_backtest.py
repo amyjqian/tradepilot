@@ -35,7 +35,6 @@ def _cfg_loose() -> ScannerConfig:
         require_ema9_above_ema20=True,
     )
     cfg.universe.min_price = 1.0
-    cfg.universe.max_price = 10000.0
     cfg.universe.min_avg_volume = 100_000
     cfg.universe.min_dollar_volume = 1_000_000.0
     return cfg

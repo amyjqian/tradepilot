@@ -16,10 +16,12 @@ import logging
 import os
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, AsyncIterator
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -550,7 +552,23 @@ def post_scan(req: ScanRequest) -> dict[str, Any]:
         log.exception("Data fetch failed")
         raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc!r}") from exc
 
-    results = scan(data, cfg)
+    # Liquidity is a daily property — on intraday scans the in-bar tail(20)
+    # would measure 20 *minutes* of volume against a daily-tuned floor and
+    # reject nearly every ticker. Fetch a small daily lookback so the engine
+    # can apply the universe filter on daily bars regardless of scan interval.
+    # CachedProvider keeps repeat fetches cheap (parquet-backed). If the
+    # daily fetch fails we fall back to the in-bar window — the scan still
+    # runs, just with the old approximate behavior.
+    daily_data: dict[str, pd.DataFrame] | None = None
+    if cfg.interval != "1d":
+        try:
+            daily_data = provider.get_bars_batch(tickers, "1d", 30)
+        except PacingBudgetExhausted as exc:
+            log.warning("Daily liquidity fetch hit pacing budget (%s); using in-bar fallback", exc)
+        except Exception as exc:
+            log.warning("Daily liquidity fetch failed (%s); using in-bar fallback", exc)
+
+    results = scan(data, cfg, daily_data=daily_data)
     payload = {
         "ran_at": datetime.now(UTC).isoformat(),
         "provider": req.provider,
@@ -642,8 +660,34 @@ def post_sector_rotation(req: SectorRotationRequest) -> dict[str, Any]:
         log.exception("Sector-rotation data fetch failed")
         raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc!r}") from exc
 
+    # Same liquidity-on-daily wiring as /scan — the constituent universe
+    # filter checks a 20-bar volume window, which on intraday means 20
+    # minutes / 100 minutes, far below the daily-tuned floors. Without
+    # daily_data the entire constituent set fails the universe gate and
+    # sector rotation returns 0 stocks even when the top sectors have
+    # plenty of breakouts. CachedProvider keeps repeat calls cheap.
+    constituent_daily_data: dict[str, pd.DataFrame] | None = None
+    if cfg.interval != "1d":
+        try:
+            constituent_daily_data = provider.get_bars_batch(
+                constituent_universe, "1d", 30
+            )
+        except PacingBudgetExhausted as exc:
+            log.warning(
+                "Sector-rotation daily liquidity fetch hit pacing budget (%s); "
+                "using in-bar fallback (likely returns 0 results on intraday)",
+                exc,
+            )
+        except Exception as exc:
+            log.warning("Sector-rotation daily liquidity fetch failed (%s)", exc)
+
     report = run_sector_rotation(
-        sector_data, spy_df, constituent_data, cfg, top_n=req.top_n,
+        sector_data,
+        spy_df,
+        constituent_data,
+        cfg,
+        top_n=req.top_n,
+        daily_data=constituent_daily_data,
     )
     payload = report.to_dict()
     payload.update(
@@ -1414,6 +1458,53 @@ def broker_journal_stats() -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+# symbol -> (cached_at_monotonic, prior_close). Daily bars only roll over once
+# a day, so a 30-minute TTL is generous and lets dashboard reconnects share.
+_PRIOR_CLOSE_CACHE: dict[str, tuple[float, float]] = {}
+_PRIOR_CLOSE_TTL_SEC = 30 * 60.0
+_PRIOR_CLOSE_LOCK = threading.Lock()
+
+
+def _prior_close_for(symbol: str) -> float | None:
+    """Most recent regular-session daily close strictly before today.
+
+    Pulled via the same Polygon CachedProvider the scanner uses, so the
+    parquet cache is shared. Returns None on any failure (no Polygon key,
+    rate limit, network) — callers must tolerate the missing field.
+    """
+    now = time.monotonic()
+    with _PRIOR_CLOSE_LOCK:
+        hit = _PRIOR_CLOSE_CACHE.get(symbol)
+        if hit is not None and (now - hit[0]) < _PRIOR_CLOSE_TTL_SEC:
+            return hit[1]
+    try:
+        provider = _state.provider("polygon")
+    except (ValueError, RuntimeError):
+        return None
+    try:
+        df = provider.get_bars(symbol, "1d", 5)
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    today = datetime.now(UTC).date()
+    # Drop today's running aggregate if Polygon emitted it; we want the prior
+    # session's close, not whatever fragment of today is sitting in there.
+    try:
+        eligible = df[df.index.date < today]
+    except (AttributeError, TypeError):
+        eligible = df
+    if eligible.empty:
+        eligible = df
+    try:
+        prior = float(eligible["close"].iloc[-1])
+    except (KeyError, IndexError, ValueError):
+        return None
+    with _PRIOR_CLOSE_LOCK:
+        _PRIOR_CLOSE_CACHE[symbol] = (now, prior)
+    return prior
+
+
 def _polygon_event_to_payload(ev: dict[str, Any]) -> dict[str, Any] | None:
     """Translate a Polygon WS event into the chart-shaped payload the
     dashboard's RealtimeChart expects.
@@ -1489,6 +1580,15 @@ async def quotes_stream(symbol: str) -> StreamingResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    # Most recent regular-session daily close strictly before today; the
+    # client uses this to compute `change_pct` against live prices without
+    # a separate REST round-trip. Failures here don't block the stream.
+    # Run via asyncio.to_thread so the synchronous Polygon REST call doesn't
+    # block the event loop — the watchlist opens ~20 SSE connections at once
+    # on a fresh page load, and serializing all those through the loop
+    # freezes every other endpoint until the cache warms up.
+    prior_close = await asyncio.to_thread(_prior_close_for, sym)
+
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=512)
     last_trade_ts = [0.0]  # mutable cell for the throttle gate
@@ -1518,7 +1618,10 @@ async def quotes_stream(symbol: str) -> StreamingResponse:
 
     async def event_gen() -> AsyncIterator[str]:
         try:
-            yield f"event: connected\ndata: {json.dumps({'symbol': sym})}\n\n"
+            connected_payload: dict[str, Any] = {"symbol": sym}
+            if prior_close is not None:
+                connected_payload["prior_close"] = prior_close
+            yield f"event: connected\ndata: {json.dumps(connected_payload)}\n\n"
             while True:
                 try:
                     ev = await asyncio.wait_for(
@@ -1546,6 +1649,126 @@ async def quotes_stream(symbol: str) -> StreamingResponse:
     )
 
 
+@app.get("/quotes/stream-multi")
+async def quotes_stream_multi(symbols: str) -> StreamingResponse:
+    """Multiplexed SSE for multiple symbols.
+
+    The single-symbol endpoint above forces the browser to open one
+    EventSource per ticker. With a watchlist of 20 top picks plus a chart,
+    the dashboard quickly hit Chrome's HTTP/1.1 cap of 6 connections per
+    origin and queued every subsequent fetch — `/quotes/history` and
+    `/scan` would silently sit pending.
+
+    This endpoint accepts a comma-separated list of symbols, opens one
+    Polygon WS subscription per symbol upstream, and folds every event
+    into a single SSE stream tagged with `symbol`. The dashboard's
+    quoteStream hub holds exactly one EventSource regardless of how many
+    components subscribe.
+    """
+    sym_list = sorted({s.strip().upper() for s in symbols.split(",") if s.strip()})
+    if not sym_list:
+        raise HTTPException(status_code=400, detail="symbols required")
+    if len(sym_list) > 100:
+        raise HTTPException(status_code=400, detail="too many symbols (max 100)")
+
+    try:
+        streamer = _state.quote_streamer()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    # Parallel prior-close lookup off the event loop — see the comment in
+    # quotes_stream for why this matters with bursty subscriptions.
+    prior_close_results = await asyncio.gather(
+        *[asyncio.to_thread(_prior_close_for, s) for s in sym_list]
+    )
+    prior_closes = {
+        s: pc
+        for s, pc in zip(sym_list, prior_close_results, strict=True)
+        if pc is not None
+    }
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=4096)
+    # Per-symbol throttle so a chatty name (think NVDA at the open) can't
+    # crowd out events for slower names — each symbol gets its own ~10/sec
+    # budget identical to the single-symbol stream.
+    last_trade_per_symbol: dict[str, float] = {}
+
+    def make_callback(symbol: str) -> Callable[[dict[str, Any]], None]:
+        def on_event(ev: dict[str, Any]) -> None:
+            if ev.get("ev") == "T":
+                now = time.monotonic()
+                if now - last_trade_per_symbol.get(symbol, 0.0) < _TRADE_THROTTLE_SEC:
+                    return
+                last_trade_per_symbol[symbol] = now
+            try:
+                loop.call_soon_threadsafe(_safe_put_pair, queue, (symbol, ev))
+            except RuntimeError:
+                pass
+
+        return on_event
+
+    sub_ids: list[int] = []
+    for symbol in sym_list:
+        try:
+            sid = streamer.subscribe(
+                symbol, channels=("AM", "T"), callback=make_callback(symbol)
+            )
+            sub_ids.append(sid)
+        except Exception:
+            log.warning("multi-stream subscribe failed for %s", symbol, exc_info=True)
+
+    async def event_gen() -> AsyncIterator[str]:
+        try:
+            connected_payload = {
+                "symbols": sym_list,
+                "prior_closes": prior_closes,
+            }
+            yield f"event: connected\ndata: {json.dumps(connected_payload)}\n\n"
+            while True:
+                try:
+                    symbol, ev = await asyncio.wait_for(
+                        queue.get(), timeout=_QUOTES_HEARTBEAT_SEC
+                    )
+                    payload = _polygon_event_to_payload(ev)
+                    if payload is None:
+                        continue
+                    payload["symbol"] = symbol
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            for sid in sub_ids:
+                try:
+                    streamer.unsubscribe(sid)
+                except Exception:
+                    log.debug("multi-stream unsubscribe raised", exc_info=True)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _safe_put_pair(
+    queue: asyncio.Queue[tuple[str, dict[str, Any]]],
+    item: tuple[str, dict[str, Any]],
+) -> None:
+    """Drop-oldest variant for the multi-symbol stream's (symbol, event) queue."""
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        try:
+            queue.get_nowait()
+            queue.put_nowait(item)
+        except Exception:
+            pass
+
+
 def _safe_put(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
     """Non-blocking enqueue with drop-oldest backpressure. Mirrors the
     pattern in scanner.broker.state — slow consumers don't block the
@@ -1566,12 +1789,20 @@ def quotes_history(
     symbol: str,
     interval: str = "1m",
     lookback_days: int = 1,
+    before_ts: int | None = None,
 ) -> dict[str, Any]:
     """Initial chart bars from Polygon REST. The dashboard's
     RealtimeChart calls this once on mount and then layers on the SSE
     stream for updates. We always go through Polygon here — TradingView
     rendered any provider before, but live updates only come from
     Polygon, so the history must match.
+
+    When `before_ts` is supplied, the window is `[end - lookback_days, end]`
+    where `end = date(before_ts)`. This is the lazy-load-on-scroll path:
+    the chart pages older bars in as the user pans left, asking only for
+    the slice it doesn't already have rather than refetching from today.
+    Without `before_ts`, the window is `[today - lookback_days, today]`
+    (the default mount-time fetch).
     """
     sym = symbol.strip().upper()
     if not sym:
@@ -1582,7 +1813,12 @@ def quotes_history(
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
-        df = provider.get_bars(sym, interval, capped_lookback)
+        if before_ts is not None:
+            end_dt = datetime.fromtimestamp(int(before_ts), UTC).date()
+            start_dt = end_dt - timedelta(days=capped_lookback)
+            df = provider.get_bars_range(sym, interval, start_dt, end_dt)
+        else:
+            df = provider.get_bars(sym, interval, capped_lookback)
     except PacingBudgetExhausted as exc:
         retry = max(1, int(round(exc.retry_after_sec)))
         raise HTTPException(
@@ -1590,6 +1826,19 @@ def quotes_history(
             detail=str(exc),
             headers={"Retry-After": str(retry)},
         ) from exc
+    except ValueError as exc:
+        # Polygon returned 200 with no bars — common when paging past the
+        # ticker's listing date or into a market-closed weekend slice.
+        # Treat as an empty page rather than 502 so the chart can stop
+        # paging without surfacing a scary error.
+        log.info("quotes_history empty page for %s: %s", sym, exc)
+        return {
+            "symbol": sym,
+            "interval": interval,
+            "lookback_days": capped_lookback,
+            "before_ts": before_ts,
+            "bars": [],
+        }
     except Exception as exc:
         log.warning("quotes_history failed for %s: %s", sym, exc)
         raise HTTPException(
@@ -1612,5 +1861,6 @@ def quotes_history(
         "symbol": sym,
         "interval": interval,
         "lookback_days": capped_lookback,
+        "before_ts": before_ts,
         "bars": bars,
     }

@@ -1,8 +1,7 @@
 {
-  "_comment": "Preset for 5-minute intraday day-trading via IBKR. Universe floors are per-bar (20 × 5m = 100 minutes of history), so the daily-bar defaults would filter out nearly everything. These floors roughly target liquid US names with >$5M per 5m bar of dollar volume.",
+  "_comment": "Preset for 5-minute intraday day-trading. Floors target liquid US names with >$5M per 5m bar of dollar volume. Note: as of the daily-liquidity refactor the engine evaluates avg_volume/dollar_volume against a daily lookback regardless of scan interval, so these per-bar floors apply only when daily_data isn't supplied (e.g. CLI runs without the dashboard's wiring).",
   "universe": {
     "min_price": 5.0,
-    "max_price": 1000.0,
     "min_avg_volume": 30000,
     "min_dollar_volume": 2000000
   },

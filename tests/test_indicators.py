@@ -69,6 +69,40 @@ def test_pct_change_today_zero_on_flat(constant_series: pd.Series) -> None:
     assert np.allclose(c.to_numpy(), 0.0)
 
 
+def test_pct_change_today_intraday_anchors_to_prior_close() -> None:
+    # Two 5-bar sessions on consecutive days. Session 1 closes at 102 after
+    # opening at 100. Session 2 gaps up to 110 at the open and walks to 114.
+    # With prior-close anchoring:
+    #   - session 1 has no prior session → falls back to its own open (100).
+    #   - session 2 anchors to session 1's last close (102), so the gap is
+    #     captured in the very first bar's reading rather than hidden.
+    d1 = pd.date_range("2025-01-02 14:30", periods=5, freq="1min", tz="UTC")
+    d2 = pd.date_range("2025-01-03 14:30", periods=5, freq="1min", tz="UTC")
+    idx = d1.append(d2)
+    closes = [100.0, 100.5, 101.0, 101.5, 102.0, 110.0, 111.0, 112.0, 113.0, 114.0]
+    df = pd.DataFrame(
+        {
+            "open": [100.0] * 5 + [110.0] * 5,
+            "high": [c * 1.001 for c in closes],
+            "low": [c * 0.999 for c in closes],
+            "close": closes,
+            "volume": [1_000.0] * 10,
+        },
+        index=idx,
+    )
+    c = pct_change_today(df)
+    # First session falls back to its own open: bar 0 close==open → 0%.
+    assert abs(c.iloc[0] - 0.0) < 1e-9
+    # Last bar of session 1 vs session-1 open: (102 - 100) / 100 * 100 = 2%.
+    assert abs(c.iloc[4] - 2.0) < 1e-9
+    # First bar of session 2 vs prior close (102): (110 - 102) / 102 * 100
+    # ≈ 7.843% — the gap is included from the very first bar.
+    assert abs(c.iloc[5] - ((110.0 - 102.0) / 102.0 * 100.0)) < 1e-9
+    # Last bar of session 2 vs prior close (102): (114 - 102) / 102 * 100
+    # ≈ 11.765%.
+    assert abs(c.iloc[9] - ((114.0 - 102.0) / 102.0 * 100.0)) < 1e-9
+
+
 def test_atr_positive(random_walk_close: pd.Series) -> None:
     df = make_ohlcv(random_walk_close, intrabar=0.01)
     a = atr(df, 14).dropna()

@@ -46,9 +46,12 @@ _DEFAULT_UA = (
 def _normalize_ticker(raw: Any) -> str | None:
     """Return a canonical ticker or None for non-equity rows.
 
-    SSGA renders Berkshire as `BRK.B`; the rest of our codebase (and
-    Polygon, yfinance) expects `BRK-B`. Cash/futures placeholders and
-    blank rows are dropped.
+    SSGA renders Berkshire as `BRK.B`. We canonicalize on the yfinance / IB
+    convention (`BRK-B`) since the static universes in scanner.sector_rotation
+    are written that way. The Polygon provider translates `-` back to `.`
+    on the wire — Polygon's API uses dots for share classes and silently
+    returns an empty result set if you query with a dash. Cash/futures
+    placeholders and blank rows are dropped.
     """
     if raw is None:
         return None

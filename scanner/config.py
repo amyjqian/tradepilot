@@ -8,14 +8,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-Interval = Literal["1d", "1h", "15m", "5m", "1m"]
+Interval = Literal["1d", "1h", "30m", "15m", "5m", "2m", "1m"]
 
 
 class UniverseConfig(BaseModel):
     """Filters applied before any signal scoring."""
 
     min_price: float = 2.0
-    max_price: float = 500.0
     min_avg_volume: int = 500_000
     min_dollar_volume: float = 10_000_000
 

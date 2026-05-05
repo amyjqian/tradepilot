@@ -77,14 +77,29 @@ class ScanResult(BaseModel):
         }
 
 
-def passes_universe_filter(df: pd.DataFrame, cfg: UniverseConfig) -> bool:
-    """Apply the universe (price/volume/dollar-volume) filter to the latest bar."""
+def passes_universe_filter(
+    df: pd.DataFrame,
+    cfg: UniverseConfig,
+    *,
+    daily_df: pd.DataFrame | None = None,
+) -> bool:
+    """Apply price + liquidity gates to the latest bar.
+
+    Liquidity ("is this ticker tradeable?") is a *per-day* property, so we
+    always evaluate it on daily bars. When `daily_df` is supplied (intraday
+    scans wire this up at the API layer), the 20-bar mean is computed from
+    daily volume — the same number a daily scan would produce. When omitted
+    (daily-bar scans, where `df` is already daily), we fall back to `df`
+    itself. Without this, intraday scans applied a daily-tuned floor of
+    500K shares against 20 *minutes* of volume and dropped almost everything.
+    """
     row = df.iloc[-1]
     price = float(row["close"])
-    if not (cfg.min_price <= price <= cfg.max_price):
+    if price < cfg.min_price:
         return False
-    # 20-day average volume.
-    avg_vol_window = df["volume"].tail(20)
+
+    liquidity_frame = daily_df if daily_df is not None else df
+    avg_vol_window = liquidity_frame["volume"].tail(20)
     if len(avg_vol_window) < 20:
         return False
     avg_vol = float(avg_vol_window.mean())
@@ -158,15 +173,69 @@ def _to_result(ticker: str, enriched: pd.DataFrame, cfg: ScannerConfig,
     )
 
 
-def scan(data: dict[str, pd.DataFrame], cfg: ScannerConfig) -> list[ScanResult]:
-    """Run the scanner pipeline over a dict of {ticker: OHLCV frame}."""
+def _reanchor_pct_change_to_daily_prior(
+    enriched: pd.DataFrame, daily_df: pd.DataFrame
+) -> None:
+    """Override `pct_change` for the most recent session's bars using the prior
+    daily-bar close.
+
+    Why: the in-frame fallback in `pct_change_today` only finds a prior session
+    when the intraday lookback window contains one. With `lookback_days=2` on a
+    Monday, the window holds only today's bars (Sat/Sun have no sessions), so
+    every bar's anchor falls back to today's open and the overnight gap is
+    hidden. Daily bars always include the prior trading day, so they're the
+    reliable source for "yesterday's regular close".
+    """
+    if not isinstance(enriched.index, pd.DatetimeIndex) or daily_df.empty:
+        return
+    intraday_dates = (
+        enriched.index.tz_convert("UTC").normalize()
+        if enriched.index.tz is not None
+        else enriched.index.normalize()
+    )
+    daily_dates = (
+        daily_df.index.tz_convert("UTC").normalize()
+        if daily_df.index.tz is not None
+        else daily_df.index.normalize()
+    )
+    latest_session = intraday_dates[-1]
+    # Strict <: if Polygon emits today's running daily aggregate after the
+    # close, we still want the *prior* day, not today.
+    prior_closes = daily_df.loc[daily_dates < latest_session, "close"]
+    if prior_closes.empty:
+        return
+    prior_close = float(prior_closes.iloc[-1])
+    if prior_close <= 0.0:
+        return
+    mask = intraday_dates == latest_session
+    enriched.loc[mask, "pct_change"] = (
+        (enriched.loc[mask, "close"] - prior_close) / prior_close * 100.0
+    )
+
+
+def scan(
+    data: dict[str, pd.DataFrame],
+    cfg: ScannerConfig,
+    *,
+    daily_data: dict[str, pd.DataFrame] | None = None,
+) -> list[ScanResult]:
+    """Run the scanner pipeline over a dict of {ticker: OHLCV frame}.
+
+    `daily_data` (optional) supplies daily bars used for two purposes: (1) the
+    liquidity gate in `passes_universe_filter` (computed per-day regardless of
+    scan interval) and (2) the prior-close anchor for today's `pct_change` on
+    intraday scans whose lookback doesn't include the previous trading day.
+    """
     results: list[ScanResult] = []
 
     for ticker, df in data.items():
         if df is None or len(df) < MIN_BARS_REQUIRED:
             continue
         enriched = enrich(df)
-        if not passes_universe_filter(enriched, cfg.universe):
+        daily_df = daily_data.get(ticker) if daily_data is not None else None
+        if daily_df is not None and not daily_df.empty:
+            _reanchor_pct_change_to_daily_prior(enriched, daily_df)
+        if not passes_universe_filter(enriched, cfg.universe, daily_df=daily_df):
             continue
         if not apply_hard_filters(enriched, cfg.thresholds):
             continue

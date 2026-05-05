@@ -46,17 +46,23 @@ log = logging.getLogger(__name__)
 
 _INTERVAL_TO_BAR_SIZE: dict[str, str] = {
     "1m": "1 min",
+    "2m": "2 mins",
     "5m": "5 mins",
     "15m": "15 mins",
+    "30m": "30 mins",
     "1h": "1 hour",
     "1d": "1 day",
 }
 
 # Conservative per-bar-size duration caps (IB rejects oversized requests).
+# 2m and 30m caps assume IB uses the same envelope as the neighboring sizes;
+# safe to tighten if real-world requests get rejected.
 _MAX_DURATION_DAYS: dict[str, int] = {
     "1m": 1,
+    "2m": 1,
     "5m": 30,
     "15m": 60,
+    "30m": 60,
     "1h": 365,
     "1d": 3650,
 }

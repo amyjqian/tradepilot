@@ -15,14 +15,45 @@ type AppView = 'trade' | 'connect'
 const VIEW_KEY = 'tradepilot.app_view'
 
 type Provider = 'synthetic' | 'yfinance' | 'ibkr' | 'polygon'
-type Interval = '1d' | '1h' | '15m' | '5m' | '1m'
+type Interval = '1d' | '1h' | '30m' | '15m' | '5m' | '2m' | '1m'
 
+// Persisted across reloads so the user doesn't land back on 1d every time
+// they refresh after picking 5m or 1h. Same lifecycle / pattern as VIEW_KEY.
+const PROVIDER_KEY = 'tradepilot.provider'
+const INTERVAL_KEY = 'tradepilot.interval'
+const LOOKBACK_KEY = 'tradepilot.lookback'
+
+const VALID_PROVIDERS: ReadonlySet<Provider> = new Set([
+  'synthetic',
+  'yfinance',
+  'ibkr',
+  'polygon',
+])
+const VALID_INTERVALS: ReadonlySet<Interval> = new Set([
+  '1d',
+  '1h',
+  '30m',
+  '15m',
+  '5m',
+  '2m',
+  '1m',
+])
+
+// Tuned for paid Polygon. The previous 1m=2 / 5m=5 defaults were inherited
+// from the IB era — IB caps 1-min requests at 1 day per request and 5-min at
+// 30, and the 10-min pacing budget made larger pulls expensive. Polygon's
+// paid tier returns weeks of intraday in a single call, and our parquet cache
+// only fetches deltas after the first hit. Bigger windows mean better EMA50
+// warmup (200 bars ≈ 3.3h on 1m) and the prior-session close is always inside
+// the lookback, so the Monday-after-weekend re-anchor crutch isn't needed.
 const DEFAULT_LOOKBACK: Record<Interval, number> = {
   '1d': 90,
-  '1h': 30,
-  '15m': 10,
-  '5m': 5,
-  '1m': 2,
+  '1h': 60,
+  '30m': 30,
+  '15m': 30,
+  '5m': 15,
+  '2m': 7,
+  '1m': 5,
 }
 
 export default function App() {
@@ -34,9 +65,28 @@ export default function App() {
     setViewState(v)
     window.localStorage.setItem(VIEW_KEY, v)
   }
-  const [provider, setProvider] = useState<Provider>('polygon')
-  const [interval, setInterval] = useState<Interval>('1d')
-  const [lookback, setLookback] = useState<number>(DEFAULT_LOOKBACK['1d'])
+  const [provider, setProviderState] = useState<Provider>(() => {
+    const saved = window.localStorage.getItem(PROVIDER_KEY)
+    return saved && VALID_PROVIDERS.has(saved as Provider)
+      ? (saved as Provider)
+      : 'polygon'
+  })
+  const [interval, setIntervalState] = useState<Interval>(() => {
+    const saved = window.localStorage.getItem(INTERVAL_KEY)
+    return saved && VALID_INTERVALS.has(saved as Interval)
+      ? (saved as Interval)
+      : '5m'
+  })
+  // Lookback is interval-derived by default but the user can override via the
+  // input. Persist the explicit value so the override survives reloads, but
+  // gate on numeric sanity so a corrupted localStorage entry doesn't push a
+  // negative or non-numeric lookback to the API.
+  const [lookback, setLookbackState] = useState<number>(() => {
+    const saved = Number(window.localStorage.getItem(LOOKBACK_KEY))
+    if (Number.isFinite(saved) && saved >= 1) return saved
+    const startInterval = (window.localStorage.getItem(INTERVAL_KEY) ?? '5m') as Interval
+    return DEFAULT_LOOKBACK[VALID_INTERVALS.has(startInterval) ? startInterval : '5m']
+  })
   const [selected, setSelected] = useState<ScanResult | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
@@ -80,9 +130,25 @@ export default function App() {
     setLivePendingApprove(null)
   }
 
+  const setProvider = (p: Provider) => {
+    setProviderState(p)
+    window.localStorage.setItem(PROVIDER_KEY, p)
+  }
+
+  const setLookback = (n: number) => {
+    setLookbackState(n)
+    window.localStorage.setItem(LOOKBACK_KEY, String(n))
+  }
+
   const changeInterval = (next: Interval) => {
-    setInterval(next)
-    setLookback(DEFAULT_LOOKBACK[next])
+    setIntervalState(next)
+    window.localStorage.setItem(INTERVAL_KEY, next)
+    // Reset lookback to the new interval's sensible default — keeping the
+    // previous lookback (e.g. 90 from 1d) when switching to 1m would force
+    // a huge fetch. The user can override afterwards via the input.
+    const nextLookback = DEFAULT_LOOKBACK[next]
+    setLookbackState(nextLookback)
+    window.localStorage.setItem(LOOKBACK_KEY, String(nextLookback))
   }
 
   const pickPosition = (p: BrokerPosition) => {

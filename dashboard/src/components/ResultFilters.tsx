@@ -32,7 +32,7 @@ const TREND_PILLS: ReadonlyArray<{
 
 /** Compact post-scan filter strip. Two rows:
  *
- *   [Filter] [VWAP+] [EMA9+] [Stacked] [Green] [Near20H]    clear
+ *   [Filter] [VWAP+] [EMA9+] [Stacked] [Green] [≤2% from high]    clear
  *   Score ≥ [n]    RSI [min]–[max]
  *
  * All filters are AND-combined. Empty/default values pass through. */
@@ -69,8 +69,11 @@ export function ResultFilters({
           onClick={toggleGreen}
         />
         <Pill
-          label={`Near${NEAR_HIGH_THRESHOLD_PCT}%`}
-          tooltip={`Show only tickers within ${NEAR_HIGH_THRESHOLD_PCT}% of the 20-bar high`}
+          label={`≤${NEAR_HIGH_THRESHOLD_PCT}% from high`}
+          tooltip={
+            `Show only tickers within ${NEAR_HIGH_THRESHOLD_PCT}% of the 20-bar ` +
+            `rolling high — 20 minutes on a 1m scan, ~4 weeks on a 1d scan`
+          }
           active={state.nearHigh}
           onClick={toggleNearHigh}
         />

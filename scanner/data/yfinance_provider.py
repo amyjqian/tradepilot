@@ -15,8 +15,10 @@ log = logging.getLogger(__name__)
 
 _INTERVAL_PERIOD_CAP = {
     "1m": 7,
+    "2m": 60,
     "5m": 60,
     "15m": 60,
+    "30m": 60,
     "1h": 730,
     "1d": 3650,
 }

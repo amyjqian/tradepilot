@@ -2,7 +2,6 @@
   "_comment": "Relaxed-gates 5m intraday preset. Same universe / weights / RSI band as intraday_5m, but the three trend hard-gates (require_above_vwap, require_above_ema9, require_ema9_above_ema20) are turned off — they become *scored inputs* (via the trend_alignment weight) rather than all-or-nothing filters. Use this when the strict preset returns zero candidates because the tape is consolidating or rotating; you'll see lower-conviction setups whose trend alignment is partial. Re-tighten the gates for live entries.",
   "universe": {
     "min_price": 5.0,
-    "max_price": 1000.0,
     "min_avg_volume": 30000,
     "min_dollar_volume": 2000000
   },

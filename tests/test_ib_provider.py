@@ -122,7 +122,7 @@ def test_interval_mapping_covers_scanner_intervals() -> None:
 def test_ib_provider_rejects_unknown_interval() -> None:
     provider = IBProvider()
     with pytest.raises(ValueError, match="Unsupported interval"):
-        provider.get_bars("AAPL", "30m", 10)
+        provider.get_bars("AAPL", "7m", 10)
 
 
 def test_ib_provider_pacing_status_snapshot() -> None:

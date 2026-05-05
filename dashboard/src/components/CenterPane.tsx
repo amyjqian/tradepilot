@@ -4,6 +4,7 @@ import { fmtCurrency, fmtMultiplier, fmtNumber, fmtPct } from '../format'
 import { ScoreBreakdown } from './ScoreBreakdown'
 import { RealtimeChart } from './RealtimeChart'
 import { ResizeHandle } from './ResizeHandle'
+import { useRealtimeQuote } from '../useRealtimeQuote'
 
 interface Props {
   selected: ScanResult | null
@@ -28,16 +29,11 @@ export function CenterPane({ selected }: Props) {
     <section className="flex h-full flex-col gap-2 bg-neutral-950 p-2">
       <header className="flex flex-wrap items-center gap-3 border-b border-neutral-800 pb-2">
         <h2 className="text-base font-semibold">{r.ticker}</h2>
-        <span className="num text-sm">{fmtCurrency(r.price)}</span>
-        <span
-          className={`num text-sm ${
-            r.pct_change >= 0
-              ? 'text-[var(--color-accent-dim)]'
-              : 'text-[var(--color-danger)]'
-          }`}
-        >
-          {fmtPct(r.pct_change, true)}
-        </span>
+        <LivePriceHeader
+          ticker={r.ticker}
+          fallbackPrice={r.price}
+          fallbackPct={r.pct_change}
+        />
         <span className="ml-auto flex items-center gap-2">
           <span className="text-[10px] uppercase tracking-wide text-neutral-500">Score</span>
           <ScoreBadge score={r.score} />
@@ -108,6 +104,49 @@ export function CenterPane({ selected }: Props) {
         </Panel>
       </PanelGroup>
     </section>
+  )
+}
+
+function LivePriceHeader({
+  ticker,
+  fallbackPrice,
+  fallbackPct,
+}: {
+  ticker: string
+  fallbackPrice: number
+  fallbackPct: number
+}) {
+  // Subscribes to /quotes/stream/{ticker} via the shared hub. Until the first
+  // tick arrives (or always, on Polygon plans without WS entitlement), we
+  // render the scan-time fallback dimmed so the user can tell whether the
+  // numbers are live. The change here also shows an absolute dollar delta vs
+  // prior close, which matters at a glance more than the percent alone.
+  const q = useRealtimeQuote(ticker)
+  const isLive = q?.connected === true && q?.price != null
+  const price = isLive ? (q!.price as number) : fallbackPrice
+  const pct =
+    isLive && q?.change_pct != null ? (q!.change_pct as number) : fallbackPct
+  const changeAbs =
+    isLive && q?.prior_close != null && q?.price != null
+      ? q!.price - q!.prior_close
+      : null
+  const dim = isLive ? '' : 'opacity-60'
+  return (
+    <>
+      <span className={`num text-sm ${dim}`} title={isLive ? 'Live' : 'Last scan'}>
+        {fmtCurrency(price)}
+      </span>
+      <span
+        className={`num text-sm ${dim} ${
+          pct >= 0 ? 'text-[var(--color-accent-dim)]' : 'text-[var(--color-danger)]'
+        }`}
+      >
+        {changeAbs != null
+          ? `${changeAbs >= 0 ? '+' : '-'}${fmtCurrency(Math.abs(changeAbs))} `
+          : ''}
+        {fmtPct(pct, true)}
+      </span>
+    </>
   )
 }
 

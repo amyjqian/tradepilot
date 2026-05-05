@@ -39,7 +39,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -57,6 +57,7 @@ _INTERVAL_TO_AGG: dict[str, tuple[int, str]] = {
     "2m": (2, "minute"),
     "5m": (5, "minute"),
     "15m": (15, "minute"),
+    "30m": (30, "minute"),
     "1h": (1, "hour"),
     "1d": (1, "day"),
 }
@@ -193,17 +194,48 @@ class PolygonProvider(MarketDataProvider):
     # ------------------------------------------------------------------
 
     def get_bars(self, ticker: str, interval: str, lookback_days: int) -> pd.DataFrame:
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=max(1, lookback_days))
+        return self._fetch_range(ticker, interval, start, end)
+
+    def get_bars_range(
+        self,
+        ticker: str,
+        interval: str,
+        start: date,
+        end: date,
+    ) -> pd.DataFrame:
+        """Fetch bars in an explicit [start, end] date window.
+
+        Used by the chart's lazy-load-on-scroll path: when the user pans past
+        the leftmost loaded bar, we ask for an older slice instead of widening
+        the from-today lookback (which would refetch already-cached bars and
+        scale linearly with how far back they've scrolled).
+        """
+        if start > end:
+            raise ValueError(f"start {start} after end {end}")
+        return self._fetch_range(ticker, interval, start, end)
+
+    def _fetch_range(
+        self, ticker: str, interval: str, start: date, end: date
+    ) -> pd.DataFrame:
         if interval not in _INTERVAL_TO_AGG:
             raise ValueError(
                 f"Unsupported interval {interval!r}; expected one of "
                 f"{list(_INTERVAL_TO_AGG)}"
             )
         multiplier, timespan = _INTERVAL_TO_AGG[interval]
-        end = datetime.now(timezone.utc).date()
-        start = end - timedelta(days=max(1, lookback_days))
+
+        # Polygon uses `.` to separate share classes (BRK.B, BF.B); yfinance
+        # and IB use `-` (BRK-B, BF-B). Our static universes were generated
+        # in yfinance style, so translate here rather than touching every
+        # caller. Polygon returns 200 OK with an empty result when given
+        # the dashed form, which is silently dropped downstream — the worst
+        # kind of bug because nothing errors, names just disappear.
+        polygon_ticker = ticker.upper().replace("-", ".")
 
         path = (
-            f"/v2/aggs/ticker/{ticker.upper()}/range/{multiplier}/{timespan}/"
+            f"/v2/aggs/ticker/{polygon_ticker}/range/{multiplier}/{timespan}/"
             f"{start.isoformat()}/{end.isoformat()}"
         )
         payload = self._request(

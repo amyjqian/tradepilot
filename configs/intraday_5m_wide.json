@@ -1,8 +1,7 @@
 {
-  "_comment": "Wide 100-ticker universe scanned on 5-minute bars via yfinance. Combines the breadth of wide_yfinance with the intraday-tuned thresholds of intraday_5m. IBKR would hit rate limits with this universe; use yfinance only. Remember yfinance 5m bars are ~15 min delayed — fine for building an intraday watchlist, not for live entry timing.",
+  "_comment": "Wide 100-ticker universe scanned on 5-minute bars. Combines the breadth of the wide preset with the intraday-tuned thresholds of intraday_5m. On Polygon paid plans this is a single batch fetch and returns in seconds; on yfinance it works too but bars are ~15 min delayed (watchlist-building only, not live entry timing); IB will exhaust its 10-min pacing budget on a universe this size, so prefer Polygon or yfinance.",
   "universe": {
     "min_price": 5.0,
-    "max_price": 2000.0,
     "min_avg_volume": 30000,
     "min_dollar_volume": 2000000
   },

@@ -9,7 +9,7 @@ import { fmtCurrency, fmtPct } from '../format'
 import { KillSwitchModal } from './KillSwitchModal'
 
 type Provider = 'synthetic' | 'yfinance' | 'ibkr' | 'polygon'
-type Interval = '1d' | '1h' | '15m' | '5m' | '1m'
+type Interval = '1d' | '1h' | '30m' | '15m' | '5m' | '2m' | '1m'
 
 interface Props {
   provider: Provider
@@ -145,8 +145,10 @@ export function TopBar({
           >
             <option value="1d">1d</option>
             <option value="1h">1h</option>
+            <option value="30m">30m</option>
             <option value="15m">15m</option>
             <option value="5m">5m</option>
+            <option value="2m">2m</option>
             <option value="1m">1m</option>
           </select>
           <input

@@ -6,6 +6,7 @@ import { useResultFilters } from '../useResultFilters'
 import { useCountdown } from '../useCountdown'
 import { ResultFilters } from './ResultFilters'
 import { AutoRescanStrip } from './AutoRescanStrip'
+import { LiveChangeBadge } from './LiveChangeBadge'
 
 interface Props {
   provider: string
@@ -20,6 +21,50 @@ interface Props {
 // timer keeps cycling across reloads.
 const RESCAN_OPTIONS = [0, 1, 2, 5, 15, 30, 60] as const
 const RESCAN_KEY = 'tradepilot.sector_rescan_min'
+
+// See WatchlistPanel for rationale — keep both panels in sync on the
+// "auto-rescan follows interval" UX.
+const INTERVAL_RESCAN_MIN: Record<string, number> = {
+  '1m': 1,
+  '2m': 2,
+  '5m': 5,
+  '15m': 15,
+  '30m': 30,
+  '1h': 60,
+  '1d': 0,
+}
+
+// Synthesize a minimal ScanResult for a sector ETF so it can be passed to
+// `onSelect` and render in the CenterPane chart. ETFs aren't scored by the
+// stock scanner — we just want the chart to load for the chosen ticker.
+// The score / pct_change / etc. come from the rotation rank when available
+// so the right-pane shows something meaningful instead of zeroes; everything
+// else is left as a sensible default.
+function _etfToScanResult(
+  etf: string,
+  data: SectorRotationResponse | null,
+): ScanResult {
+  const rank = data?.ranked.find((s) => s.etf === etf)
+  return {
+    ticker: etf,
+    score: 0,
+    price: 0,
+    pct_change: rank?.pct_change_5 ?? 0,
+    rel_volume: 0,
+    rsi: 0,
+    above_vwap: false,
+    above_ema9: false,
+    ema_stacked: false,
+    dist_from_20d_high_pct: 0,
+    signals: {},
+    reasons: rank
+      ? [
+          `${rank.name} sector ETF`,
+          `Rotation score ${rank.score >= 0 ? '+' : ''}${rank.score.toFixed(2)}%`,
+        ]
+      : [`${etf} sector ETF`],
+  }
+}
 
 function loadStoredRescan(): number {
   const n = Number(window.localStorage.getItem(RESCAN_KEY))
@@ -48,6 +93,9 @@ export function SectorRotationPanel({
   const [runStartedAt, setRunStartedAt] = useState<Date | null>(null)
   const [runEndedAt, setRunEndedAt] = useState<Date | null>(null)
   const inFlightRef = useRef(false)
+  // See WatchlistPanel — bumped on interval/lookback change so an in-flight
+  // rotation scan can't paint stale results over the freshly-kicked-off one.
+  const scanGenRef = useRef(0)
   const filters = useResultFilters()
   const countdown = useCountdown(lastRunAt, nextRunAt, rescanMin > 0)
 
@@ -62,6 +110,7 @@ export function SectorRotationPanel({
     // back-to-back rescans.
     if (inFlightRef.current) return
     inFlightRef.current = true
+    const myGen = scanGenRef.current
     const startedAt = new Date()
     setRunStartedAt(startedAt)
     setRunEndedAt(null)
@@ -73,13 +122,15 @@ export function SectorRotationPanel({
         lookback_days: lookback,
         top_n: topN,
       })
+      // Discard if interval/lookback changed since this fetch started.
+      if (myGen !== scanGenRef.current) return
       setData(res)
       setActiveSector(null)
       setLastRunAt(new Date())
     } catch (e) {
-      onError(String(e))
+      if (myGen === scanGenRef.current) onError(String(e))
     } finally {
-      setLoading(false)
+      if (myGen === scanGenRef.current) setLoading(false)
       setRunEndedAt(new Date())
       inFlightRef.current = false
     }
@@ -127,6 +178,25 @@ export function SectorRotationPanel({
     }
   }, [data, activeSector])
 
+  // Re-fetch when the user changes interval/lookback in the top bar — the
+  // rendered results were computed for the old timeframe and would otherwise
+  // sit stale until the next periodic auto-rescan boundary. Same scanGen +
+  // rescan-sync handling as WatchlistPanel.
+  const initialMountRef = useRef(true)
+  useEffect(() => {
+    if (initialMountRef.current) {
+      initialMountRef.current = false
+      return
+    }
+    scanGenRef.current += 1
+    inFlightRef.current = false
+    setData(null)
+    const mapped = INTERVAL_RESCAN_MIN[interval]
+    if (mapped !== undefined && mapped !== rescanMin) setRescanMin(mapped)
+    void run()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [interval, lookback])
+
   const topSet = new Set(data?.top_etfs ?? [])
 
   /** Filter the pooled results to the user-selected sector, or show
@@ -151,7 +221,17 @@ export function SectorRotationPanel({
       : '—'
 
   const toggleSector = (etf: string) => {
-    setActiveSector((prev) => (prev === etf ? null : etf))
+    setActiveSector((prev) => {
+      const next = prev === etf ? null : etf
+      // When activating a new sector, also load the ETF's chart in the
+      // center pane so the user sees the rotation context they just picked.
+      // Skip on deactivation (clicking the active row to clear the filter)
+      // — keep the chart they were looking at instead of resetting it.
+      if (next !== null && next !== prev) {
+        onSelect(_etfToScanResult(etf, data))
+      }
+      return next
+    })
   }
 
   return (
@@ -390,15 +470,7 @@ function ScannerRow({
       >
         <span className="flex items-center gap-2">
           <span className="font-semibold">{r.ticker}</span>
-          <span
-            className={`num text-[11px] ${
-              r.pct_change >= 0
-                ? 'text-[var(--color-accent-dim)]'
-                : 'text-[var(--color-danger)]'
-            }`}
-          >
-            {fmtPct(r.pct_change, true)}
-          </span>
+          <LiveChangeBadge ticker={r.ticker} fallbackPct={r.pct_change} />
         </span>
         <span className="flex items-center gap-2">
           <span className="h-1.5 w-12 overflow-hidden rounded bg-neutral-800">

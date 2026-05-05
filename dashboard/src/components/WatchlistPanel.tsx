@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchWatchlist, runScan, saveWatchlist } from '../api'
 import type { ScanResponse, ScanResult } from '../types'
-import { fmtNumber, fmtPct } from '../format'
+import { fmtNumber } from '../format'
 import { useResultFilters } from '../useResultFilters'
 import { useCountdown } from '../useCountdown'
 import { ResultFilters } from './ResultFilters'
 import { AutoRescanStrip } from './AutoRescanStrip'
+import { LiveChangeBadge } from './LiveChangeBadge'
 
 interface Props {
   provider: string
@@ -22,6 +23,20 @@ interface Props {
 // because the panel stays mounted (see LeftRail's PanelHost).
 const RESCAN_OPTIONS = [0, 1, 2, 5, 15, 30, 60] as const
 const RESCAN_KEY = 'tradepilot.watchlist_rescan_min'
+
+// Interval → auto-rescan minutes. A 5m chart auto-rescans every 5 minutes,
+// 15m every 15, etc. — one fresh scan per closed bar. Daily defaults to off
+// because there's no closed bar to wait for during the trading day. The user
+// can still override in the AUTO dropdown afterwards.
+const INTERVAL_RESCAN_MIN: Record<string, number> = {
+  '1m': 1,
+  '2m': 2,
+  '5m': 5,
+  '15m': 15,
+  '30m': 30,
+  '1h': 60,
+  '1d': 0,
+}
 
 function loadStoredRescan(): number {
   const n = Number(window.localStorage.getItem(RESCAN_KEY))
@@ -47,6 +62,10 @@ export function WatchlistPanel({
   const [runStartedAt, setRunStartedAt] = useState<Date | null>(null)
   const [runEndedAt, setRunEndedAt] = useState<Date | null>(null)
   const inFlightRef = useRef(false)
+  // Bumped on every interval/lookback change so the result of an in-flight
+  // scan that started under the old interval gets dropped on arrival rather
+  // than overwriting fresh state with stale rows.
+  const scanGenRef = useRef(0)
   const filters = useResultFilters()
   const countdown = useCountdown(lastRunAt, nextRunAt, rescanMin > 0)
 
@@ -70,6 +89,7 @@ export function WatchlistPanel({
     }
     if (inFlightRef.current) return
     inFlightRef.current = true
+    const myGen = scanGenRef.current
     const startedAt = new Date()
     setRunStartedAt(startedAt)
     setRunEndedAt(null)
@@ -81,16 +101,51 @@ export function WatchlistPanel({
         lookback_days: lookback,
         tickers,
       })
+      // If interval/lookback changed while this fetch was in flight, the
+      // result is stale — drop it so we don't paint old-interval rows over
+      // the fresh state the change-effect just kicked off.
+      if (myGen !== scanGenRef.current) return
       setScan(res)
       setLastRunAt(new Date())
     } catch (e) {
-      onError(String(e))
+      if (myGen === scanGenRef.current) onError(String(e))
     } finally {
-      setLoading(false)
+      if (myGen === scanGenRef.current) setLoading(false)
       setRunEndedAt(new Date())
       inFlightRef.current = false
     }
   }, [provider, interval, lookback, tickers, onError])
+
+  // When the user flips interval (or lookback) in the top bar, the existing
+  // results are computed for the old timeframe — staring at "MU +4.84% on 1m"
+  // and switching to 15m was leaving the old numbers on screen because the
+  // auto-rescan effect below only fires run() on its own schedule. Treat a
+  // timeframe change as an explicit "show me the new data now" gesture: clear
+  // the stale result so the panel acknowledges the change, then re-fetch.
+  const initialMountRef = useRef(true)
+  useEffect(() => {
+    if (initialMountRef.current) {
+      initialMountRef.current = false
+      return
+    }
+    if (tickers.length === 0) return
+    // Invalidate any in-flight scan and free the gate so the new scan can
+    // fire without waiting for the stale one to drain. The stale fetch's
+    // result is dropped on arrival via the scanGen check in `run()`.
+    scanGenRef.current += 1
+    inFlightRef.current = false
+    setScan(null)
+    // Sync the auto-rescan period to the new bar interval so scans align
+    // with closed bars (5m chart → rescan every 5m). Skips for intervals
+    // that don't have a sensible default cadence (1d).
+    const mapped = INTERVAL_RESCAN_MIN[interval]
+    if (mapped !== undefined && mapped !== rescanMin) setRescanMin(mapped)
+    void run()
+    // run/tickers/rescanMin intentionally excluded — they change every
+    // render and would re-fire this loop spuriously. We only want
+    // interval/lookback to drive the reset.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [interval, lookback])
 
   // Auto-rescan, aligned to wall-clock boundaries + 5 seconds. See
   // SectorRotationPanel for the rationale; same self-rescheduling
@@ -298,15 +353,7 @@ function ScannerRow({
       >
         <span className="flex items-center gap-2">
           <span className="font-semibold">{r.ticker}</span>
-          <span
-            className={`num text-[11px] ${
-              r.pct_change >= 0
-                ? 'text-[var(--color-accent-dim)]'
-                : 'text-[var(--color-danger)]'
-            }`}
-          >
-            {fmtPct(r.pct_change, true)}
-          </span>
+          <LiveChangeBadge ticker={r.ticker} fallbackPct={r.pct_change} />
         </span>
         <span className="flex items-center gap-2">
           <span className="h-1.5 w-12 overflow-hidden rounded bg-neutral-800">

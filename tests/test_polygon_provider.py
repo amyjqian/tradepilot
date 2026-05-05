@@ -140,7 +140,7 @@ def test_get_bars_batch_skips_failed_tickers() -> None:
 def test_unsupported_interval() -> None:
     p = _make_provider(lambda _r: httpx.Response(200, json={}))
     with pytest.raises(ValueError, match="Unsupported interval"):
-        p.get_bars("AAPL", "30m", lookback_days=10)
+        p.get_bars("AAPL", "7m", lookback_days=10)
 
 
 def test_minute_limiter_blocks_when_full() -> None:

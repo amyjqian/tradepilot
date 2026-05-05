@@ -62,7 +62,7 @@ SECTOR_CONSTITUENTS: dict[str, list[str]] = {
     ],
     "XLE": [
         "XOM", "CVX", "COP", "EOG", "WMB", "SLB", "MPC", "PSX", "OKE",
-        "VLO", "PXD", "HES", "OXY", "KMI", "BKR", "FANG", "DVN", "HAL",
+        "VLO", "OXY", "KMI", "BKR", "FANG", "DVN", "HAL",
         "TRGP", "EQT", "LNG",
     ],
     "XLI": [
@@ -102,8 +102,8 @@ SECTOR_CONSTITUENTS: dict[str, list[str]] = {
     ],
     "XLC": [
         "META", "GOOGL", "GOOG", "NFLX", "DIS", "TMUS", "VZ", "T", "CMCSA",
-        "EA", "TTWO", "WBD", "OMC", "CHTR", "PARA", "MTCH", "FOX", "FOXA",
-        "NWSA", "IPG", "LYV",
+        "EA", "TTWO", "WBD", "OMC", "CHTR", "MTCH", "FOX", "FOXA",
+        "NWSA", "LYV",
     ],
 }
 
@@ -259,6 +259,7 @@ def run_sector_rotation(
     cfg: ScannerConfig,
     *,
     top_n: int = 2,
+    daily_data: dict[str, pd.DataFrame] | None = None,
 ) -> SectorRotationReport:
     """Rank sectors, take the top `top_n`, scan their pooled constituents.
 
@@ -266,6 +267,12 @@ def run_sector_rotation(
     surface alt leadership when the #1 sector has thin breadth, without
     diluting the rotation signal across half the market. Pass `top_n=1`
     for the strict "strongest sector only" behavior.
+
+    `daily_data` (optional) — same role as in `engine.scan`: daily-bar
+    frames used by the universe filter so liquidity is evaluated per-day
+    rather than per-bar. Without it, intraday scans of the constituent
+    universe fail the daily-tuned `min_avg_volume` floor and the report
+    comes back with zero results.
     """
     ranked = rank_sectors(sector_data, spy_df)
     if not ranked:
@@ -289,7 +296,12 @@ def run_sector_rotation(
                 constituents.append(ticker)
 
     snap = {t: df for t, df in constituent_data.items() if t in seen}
-    results = scan(snap, cfg) if snap else []
+    daily_snap = (
+        {t: df for t, df in daily_data.items() if t in seen}
+        if daily_data is not None
+        else None
+    )
+    results = scan(snap, cfg, daily_data=daily_snap) if snap else []
 
     return SectorRotationReport(
         ranked=ranked,

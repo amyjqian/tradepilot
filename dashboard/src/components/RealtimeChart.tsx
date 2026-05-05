@@ -13,6 +13,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { BASE_URL } from '../api'
+import { subscribeQuote, subscribeRawEvents } from '../quoteStream'
 
 interface Bar {
   time: number
@@ -23,7 +24,7 @@ interface Bar {
   volume: number
 }
 
-type Interval = '1m' | '2m' | '5m' | '15m' | '1d'
+type Interval = '1m' | '2m' | '5m' | '15m' | '30m' | '1h' | '1d'
 
 interface Props {
   ticker: string
@@ -32,23 +33,26 @@ interface Props {
   lookbackDays?: number
 }
 
-type StreamEvent =
-  | { kind: 'bar'; payload: Bar & { vwap?: number } }
-  | { kind: 'trade'; payload: { price: number; size: number; ts: number } }
-
 const INTERVAL_SECONDS: Record<Interval, number> = {
   '1m': 60,
   '2m': 120,
   '5m': 300,
   '15m': 900,
+  '30m': 1800,
+  '1h': 3600,
   '1d': 86400,
 }
 
+// Mirror DEFAULT_LOOKBACK in App.tsx — see the comment there for rationale.
+// Chart and scanner pull the same window so EMAs/VWAP overlay the bars the
+// scanner ranked off of, without one path doing more warmup than the other.
 const INTERVAL_DEFAULT_LOOKBACK: Record<Interval, number> = {
-  '1m': 2,
-  '2m': 3,
-  '5m': 5,
-  '15m': 10,
+  '1m': 5,
+  '2m': 7,
+  '5m': 15,
+  '15m': 30,
+  '30m': 30,
+  '1h': 60,
   '1d': 90,
 }
 
@@ -68,6 +72,8 @@ const DEFAULT_VISIBLE_BARS: Record<Interval, number> = {
   '2m': 180,
   '5m': 78,
   '15m': 130,
+  '30m': 80,
+  '1h': 60,
   '1d': 60,
 }
 
@@ -101,11 +107,19 @@ function loadIndicators(): IndicatorState {
   }
 }
 
+const VALID_INTERVALS: ReadonlySet<Interval> = new Set([
+  '1m',
+  '2m',
+  '5m',
+  '15m',
+  '30m',
+  '1h',
+  '1d',
+])
+
 function loadInterval(ticker: string, fallback: Interval): Interval {
   const raw = window.localStorage.getItem(`${INTERVAL_KEY_PREFIX}.${ticker}`)
-  if (raw && (raw === '1m' || raw === '2m' || raw === '5m' || raw === '15m' || raw === '1d')) {
-    return raw
-  }
+  if (raw && VALID_INTERVALS.has(raw as Interval)) return raw as Interval
   return fallback
 }
 
@@ -160,7 +174,6 @@ export function RealtimeChart({
   const ema9SeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const vwapSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const rsiSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
-  const sseRef = useRef<EventSource | null>(null)
   /** Horizontal live-price line on the candle pane. Created lazily on
    * the first price we know, then updated on every trade tick so the
    * line slides with the tape — visible cue of "where price is now"
@@ -175,6 +188,24 @@ export function RealtimeChart({
     cumPV: 0,
     cumV: 0,
   })
+  // Bucket time of the latest bar when it was synthesized from `T` (trade)
+  // events rather than confirmed by `AM`. Polygon emits AM at minute close,
+  // so without this synthesis the rightmost candle on the chart always
+  // represents the *previous* minute — feels like a 1-minute lag. Trade
+  // ticks let us draw a live partial candle that grows in real time, then
+  // gets replaced by the canonical AM aggregate when the minute rolls over.
+  // Only tracked for the 1m timeframe; higher TFs let AM extend the bar.
+  const partialBucketRef = useRef<number | null>(null)
+
+  // Lazy-load history when the user pans past the leftmost loaded bar.
+  // `loadingMoreRef` gates concurrent fetches; `hasMoreHistoryRef` flips to
+  // false when a fetch returns 0 bars (we've hit the ticker's listing date
+  // or whatever Polygon will give us). `loadGenRef` is a generation counter
+  // bumped on every ticker/interval change so a slow in-flight page-back
+  // can't stomp the chart with the previous ticker's bars.
+  const loadingMoreRef = useRef<boolean>(false)
+  const hasMoreHistoryRef = useRef<boolean>(true)
+  const loadGenRef = useRef<number>(0)
 
   const [interval, setInterval] = useState<Interval>(() =>
     loadInterval(ticker, defaultInterval),
@@ -343,6 +374,39 @@ export function RealtimeChart({
     setError(null)
     setStreamConnected(false)
 
+    // Wipe everything left over from the previously-selected ticker BEFORE
+    // the new fetch starts. Without this, the WS subscription for the new
+    // ticker begins delivering trade ticks immediately (so the live-price
+    // line jumps to the new price) while the candle/EMA9/VWAP series still
+    // hold the old ticker's bars. The right price scale then auto-fits over
+    // the union of both — e.g. switching from a $14 ticker to WDC at $441
+    // leaves the scale stretched ~$14–$441 (showing as labels 100/200/.../500)
+    // instead of the tight ~$440–$445 range the new data alone would warrant.
+    // Removing the live-price line too prevents its old axis label from
+    // ghosting at the previous ticker's price until a fresh tick arrives.
+    barsRef.current = []
+    sessionVwapRef.current = { key: '', cumPV: 0, cumV: 0 }
+    partialBucketRef.current = null
+    // Bump the generation so any older lazy-load page-backs in flight
+    // (still under the previous ticker) get rejected when they resolve.
+    loadGenRef.current += 1
+    loadingMoreRef.current = false
+    hasMoreHistoryRef.current = true
+    setLastPrice(null)
+    setPrevSessionClose(null)
+    candleSeriesRef.current.setData([])
+    volSeriesRef.current.setData([])
+    ema9SeriesRef.current?.setData([])
+    vwapSeriesRef.current?.setData([])
+    rsiSeriesRef.current?.setData([])
+    if (livePriceLineRef.current) {
+      candleSeriesRef.current.removePriceLine(livePriceLineRef.current)
+      livePriceLineRef.current = null
+    }
+    // Re-arm autoScale in case the user dragged the axis into manual mode
+    // on a previous ticker — we want the new bars to drive the visible range.
+    chartRef.current?.priceScale('right').applyOptions({ autoScale: true })
+
     const lookback = lookbackDays ?? INTERVAL_DEFAULT_LOOKBACK[interval]
     const controller = new AbortController()
     const url =
@@ -406,41 +470,50 @@ export function RealtimeChart({
         setError(`history: ${String(e)}`)
       })
 
-    // Live updates — Polygon AM (1-minute) events through our SSE.
-    // For non-1m intervals we bucket the events into the higher TF.
-    const es = new EventSource(
-      `${BASE_URL}/quotes/stream/${encodeURIComponent(ticker)}`,
-    )
-    sseRef.current = es
-
-    es.addEventListener('connected', () => {
+    // Live updates flow through the shared quoteStream hub so the chart
+    // shares an EventSource with the watchlist row badge + the price header
+    // for the same ticker. Without this, each chart pane would open its own
+    // SSE (one more per ticker) and we'd hit the browser's HTTP/1.1 cap of
+    // ~6 connections per origin once the watchlist had a few rows + an open
+    // chart, leaving the chart's stream wedged in CONNECTING.
+    const unsubSnap = subscribeQuote(ticker, (snap) => {
       if (cancelled) return
-      setStreamConnected(true)
+      setStreamConnected(snap.connected)
     })
-    es.onmessage = (ev) => {
+    const unsubRaw = subscribeRawEvents(ticker, (msg) => {
       if (cancelled) return
-      try {
-        const msg = JSON.parse(ev.data) as StreamEvent
-        if (msg.kind === 'bar') {
-          applyLiveBar(msg.payload)
-        } else if (msg.kind === 'trade') {
-          // Sub-second tick — update the toolbar pill + live-price
-          // line. The candle stays minute-cadence; this is purely the
-          // "ongoing trend" cue between AM events.
-          setLastPrice(msg.payload.price)
-          setLivePrice(msg.payload.price)
-        }
-      } catch (e) {
-        setError(`stream parse: ${String(e)}`)
+      if (msg.kind === 'bar') {
+        applyLiveBar(msg.payload)
+      } else if (msg.kind === 'trade') {
+        // Sub-second tick — update the toolbar pill + live-price line and,
+        // on the 1m timeframe, grow the partial in-progress candle so the
+        // chart isn't stuck on the previous minute's close.
+        setLastPrice(msg.payload.price)
+        setLivePrice(msg.payload.price)
+        applyLiveTrade(msg.payload.price, msg.payload.ts)
       }
+    })
+
+    // Lazy-load older bars when the user pans past the leftmost loaded bar.
+    // Lightweight-charts' visible-range fires with negative `from` indices
+    // when the user has scrolled into "empty space" past the first bar.
+    // Trigger when within ~50 bars of the left edge (gives the fetch a
+    // chance to complete before the user actually hits the wall).
+    const tsApi = chartRef.current?.timeScale()
+    const PAGE_TRIGGER_DISTANCE = 50
+    const onVisibleRangeChange = (range: { from: number; to: number } | null) => {
+      if (!range) return
+      if (range.from > PAGE_TRIGGER_DISTANCE) return
+      void loadOlderHistory()
     }
-    es.onerror = () => setStreamConnected(false)
+    tsApi?.subscribeVisibleLogicalRangeChange(onVisibleRangeChange)
 
     return () => {
       cancelled = true
       controller.abort()
-      es.close()
-      sseRef.current = null
+      unsubSnap()
+      unsubRaw()
+      tsApi?.unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ticker, interval, lookbackDays])
@@ -482,14 +555,23 @@ export function RealtimeChart({
 
     let updated: Bar
     if (last && last.time === bucketStart) {
-      // Update the existing bar in place.
-      updated = {
-        time: bucketStart,
-        open: last.open,
-        high: Math.max(last.high, b.high),
-        low: Math.min(last.low, b.low),
-        close: b.close,
-        volume: last.volume + b.volume,
+      if (partialBucketRef.current === bucketStart) {
+        // Bar was synthesized from trade ticks; replace it with the
+        // canonical AM aggregate so OHLCV matches Polygon's official
+        // numbers. Without this we'd carry a partial open derived from
+        // the first trade we saw and double-count volume on AM arrival.
+        updated = { ...b, time: bucketStart }
+        partialBucketRef.current = null
+      } else {
+        // Higher-TF bucket still being filled by successive AM slices.
+        updated = {
+          time: bucketStart,
+          open: last.open,
+          high: Math.max(last.high, b.high),
+          low: Math.min(last.low, b.low),
+          close: b.close,
+          volume: last.volume + b.volume,
+        }
       }
       bars[bars.length - 1] = updated
     } else if (last && bucketStart < last.time) {
@@ -499,6 +581,7 @@ export function RealtimeChart({
       // New bucket.
       updated = { ...b, time: bucketStart }
       bars.push(updated)
+      partialBucketRef.current = null
     }
 
     candleSeriesRef.current?.update({
@@ -551,6 +634,163 @@ export function RealtimeChart({
     }
   }
 
+  /** Grow the in-progress 1m candle from a sub-second trade tick so the
+   * rightmost bar reflects the live tape rather than the previous minute's
+   * close. Restricted to 1m: on higher TFs each AM is a slice of an
+   * unfinished bucket and combining trade-driven OHLC with AM extensions
+   * means double-counting (the AM volume already includes those trades).
+   * For 1m, when the minute closes Polygon's AM event will replace this
+   * partial with the canonical aggregate via applyLiveBar's partial branch. */
+  function applyLiveTrade(price: number, ts: number): void {
+    if (interval !== '1m') return
+    const intervalSec = INTERVAL_SECONDS[interval]
+    const bucketStart = Math.floor(ts / intervalSec) * intervalSec
+    const bars = barsRef.current
+    const last = bars[bars.length - 1]
+
+    let updated: Bar
+    if (last && last.time === bucketStart) {
+      // Extend the live partial. close = latest trade; high/low track the
+      // running extremes within the minute.
+      updated = {
+        time: last.time,
+        open: last.open,
+        high: Math.max(last.high, price),
+        low: Math.min(last.low, price),
+        close: price,
+        volume: last.volume,
+      }
+      bars[bars.length - 1] = updated
+    } else if (last && bucketStart < last.time) {
+      return
+    } else {
+      // First trade of a new minute — open a partial bar at this price.
+      // Volume stays 0 until AM provides the canonical figure: we don't
+      // see every print due to server-side throttling, so summing trade
+      // sizes here would systematically underreport.
+      updated = {
+        time: bucketStart,
+        open: price,
+        high: price,
+        low: price,
+        close: price,
+        volume: 0,
+      }
+      bars.push(updated)
+      partialBucketRef.current = bucketStart
+    }
+
+    candleSeriesRef.current?.update({
+      time: updated.time as UTCTimestamp,
+      open: updated.open,
+      high: updated.high,
+      low: updated.low,
+      close: updated.close,
+    })
+  }
+
+  /** Page in older bars when the user scrolls past the leftmost loaded bar.
+   *
+   * The chart caches its bars in `barsRef.current`. When the visible range's
+   * left edge approaches index 0 (or goes negative — lightweight-charts
+   * lets you pan into "empty" space past the first bar), we ask the API
+   * for the slice ending just before our current oldest bar. New bars are
+   * prepended; the indicators are recomputed; the visible range is shifted
+   * by the number of inserted bars so the user's scroll position over the
+   * data they were looking at stays put.
+   *
+   * Stops paging when the API returns 0 bars (we've hit Polygon's available
+   * history for this ticker / interval). Concurrent calls are gated by
+   * `loadingMoreRef`. A bumped `loadGenRef` cancels any in-flight page-back
+   * after the user switches ticker / interval so we don't splice the wrong
+   * ticker's bars into the new chart. */
+  async function loadOlderHistory(): Promise<void> {
+    if (loadingMoreRef.current) return
+    if (!hasMoreHistoryRef.current) return
+    if (barsRef.current.length === 0) return
+    if (!candleSeriesRef.current || !volSeriesRef.current) return
+
+    loadingMoreRef.current = true
+    const myGen = loadGenRef.current
+    const oldestTime = barsRef.current[0].time
+    // Match the chart's mount-time lookback so a 1m chart pages 5 days at
+    // a time, 1d pages 90 days at a time, etc. Each fetch is comparable in
+    // cost to the initial render — cached parquet path on Polygon means
+    // only the new days actually hit the wire.
+    const pageDays = INTERVAL_DEFAULT_LOOKBACK[interval]
+    const url =
+      `${BASE_URL}/quotes/history/${encodeURIComponent(ticker)}` +
+      `?interval=${interval}&lookback_days=${pageDays}` +
+      `&before_ts=${oldestTime}`
+
+    try {
+      const r = await fetch(url)
+      if (!r.ok) return
+      const data = (await r.json()) as { bars: Bar[] }
+      if (myGen !== loadGenRef.current) return
+      const incoming = data.bars ?? []
+      if (incoming.length === 0) {
+        hasMoreHistoryRef.current = false
+        return
+      }
+
+      // Dedup by `time` — Polygon's date window is inclusive, so the boundary
+      // bar between pages would otherwise double up.
+      const existingTimes = new Set(barsRef.current.map((b) => b.time))
+      const olderOnly = incoming.filter(
+        (b) => !existingTimes.has(b.time) && b.time < oldestTime,
+      )
+      if (olderOnly.length === 0) {
+        // Nothing genuinely older arrived — assume we're at the bottom so a
+        // user dragging at the edge stops re-firing the same fetch forever.
+        hasMoreHistoryRef.current = false
+        return
+      }
+
+      const merged = [...olderOnly, ...barsRef.current]
+      barsRef.current = merged
+
+      // Save the user's current scroll position so we can restore it after
+      // setData (which would otherwise auto-fit). Logical indices shift by
+      // the number of bars we prepended.
+      const tsApi = chartRef.current?.timeScale()
+      const savedRange = tsApi?.getVisibleLogicalRange()
+
+      const candles: CandlestickData[] = merged.map((b) => ({
+        time: b.time as UTCTimestamp,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+      }))
+      const vols: HistogramData[] = merged.map((b) => ({
+        time: b.time as UTCTimestamp,
+        value: b.volume,
+        color:
+          b.close >= b.open
+            ? 'rgba(34,197,94,0.4)'
+            : 'rgba(239,68,68,0.4)',
+      }))
+      candleSeriesRef.current.setData(candles)
+      volSeriesRef.current.setData(vols)
+      drawIndicators(merged)
+
+      const shift = olderOnly.length
+      if (savedRange && tsApi) {
+        tsApi.setVisibleLogicalRange({
+          from: savedRange.from + shift,
+          to: savedRange.to + shift,
+        })
+      }
+    } catch {
+      // Network/parse failures aren't fatal — the user can pan again and
+      // we'll retry. We don't surface an error toast for these because the
+      // chart still has the data it had before.
+    } finally {
+      loadingMoreRef.current = false
+    }
+  }
+
   /** Recompute and set every active indicator from a bar history. Called
    * after history load and whenever an indicator is toggled on. */
   function drawIndicators(bars: Bar[]): void {
@@ -596,7 +836,10 @@ export function RealtimeChart({
   }
 
   // Toolbar
-  const intervals: Interval[] = useMemo(() => ['1m', '2m', '5m', '15m', '1d'], [])
+  const intervals: Interval[] = useMemo(
+    () => ['1m', '2m', '5m', '15m', '30m', '1h', '1d'],
+    [],
+  )
 
   return (
     <div className="relative flex h-full w-full flex-col">

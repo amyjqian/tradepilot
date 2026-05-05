@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -47,6 +48,20 @@ def _ttl_for(interval: str, overrides: dict[str, float] | None = None) -> float:
     if overrides and interval in overrides:
         return overrides[interval]
     return _STALENESS_TTL_SEC.get(interval, 120.0)
+
+
+# Polygon's date-ranged fetch is calendar-based: a request that starts on
+# 2026-04-04 (Saturday) returns the first trading bar on 2026-04-06. The
+# cache's `index[0]` is then permanently later than the calendar `wanted_start`
+# we compute from `now - lookback_days`, and the left-edge check below
+# would treat that as "missing data" and refetch the full window on every
+# scan — even though Polygon won't ever produce earlier bars, because no
+# trading happened. Same story for holidays, post-IPO listings, or any
+# non-RTH gap at the lookback boundary. Allowing four calendar days of
+# slack covers any 3-day-weekend + a one-day buffer; the worst case if the
+# cache really is short some genuine bars is that the chart shows a little
+# less history than asked, which beats the network stampede.
+_LEFT_EDGE_SLACK = pd.Timedelta(days=4)
 
 
 def _delta_lookback_days(last_ts: pd.Timestamp, now: pd.Timestamp) -> int:
@@ -174,9 +189,11 @@ class CachedProvider(MarketDataProvider):
         # so the count test passes even when only 1 day is cached. We
         # compare timestamps instead so a request whose lookback grew
         # (e.g. 30d → 90d) gets the older portion backfilled rather than
-        # silently truncated to whatever the cache happened to hold.
+        # silently truncated to whatever the cache happened to hold. The
+        # `_LEFT_EDGE_SLACK` keeps weekends/holidays from re-triggering a
+        # full 30-day refetch on every scan — see the constant's comment.
         wanted_start = now - pd.Timedelta(days=lookback_days)
-        if cached.index[0] > wanted_start:
+        if cached.index[0] > wanted_start + _LEFT_EDGE_SLACK:
             return None, lookback_days  # full fetch — backfill left edge
 
         age = self._cache.age_sec(ticker, interval)
@@ -229,6 +246,32 @@ class CachedProvider(MarketDataProvider):
         inner_dc = getattr(self._wrapped, "disconnect", None)
         if callable(inner_dc):
             inner_dc()
+
+    def get_bars_range(
+        self,
+        ticker: str,
+        interval: str,
+        start: date,
+        end: date,
+    ) -> pd.DataFrame:
+        """Pass-through to the wrapped provider's date-ranged fetch.
+
+        The parquet cache is a from-today rolling window — it doesn't help
+        with arbitrary historical page-back requests (the chart's lazy-load).
+        Caching specific [start, end] windows would create a fragmented
+        cache layout that's complex to merge with the rolling one. Until
+        we have evidence it matters, just forward.
+
+        Raises AttributeError if the wrapped provider doesn't implement
+        get_bars_range — only PolygonProvider does today.
+        """
+        fn = getattr(self._wrapped, "get_bars_range", None)
+        if fn is None:
+            raise AttributeError(
+                f"{type(self._wrapped).__name__} does not support "
+                "get_bars_range; only Polygon does"
+            )
+        return fn(ticker, interval, start, end)
 
     def get_bars_batch(
         self, tickers: list[str], interval: str, lookback_days: int

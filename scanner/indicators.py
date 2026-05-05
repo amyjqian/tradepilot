@@ -89,6 +89,36 @@ def gap_pct(df: pd.DataFrame) -> pd.Series:
 
 
 def pct_change_today(df: pd.DataFrame) -> pd.Series:
+    """Percent change versus prior session close — the standard daily quote.
+
+    Intraday bars → each bar reads `(close - prior_session_close) / prior_session_close`,
+    where `prior_session_close` is the last bar of the previous calendar date
+    in the frame. This includes the gap from yesterday's close, which is what
+    a quote screen and a day trader mean by "today's % change" (e.g. MU at
+    $585 vs $542 prior close = +8%). Bars in the first session of the lookback
+    window have no prior session to anchor against; they fall back to their
+    own session's first-bar open so the value is still relative to today.
+    Daily bars → `close.pct_change()` (vs prior bar's close — same idea).
+    """
+    if isinstance(df.index, pd.DatetimeIndex) and _is_intraday_index(df.index):
+        dates = (
+            df.index.tz_convert("UTC").normalize()
+            if df.index.tz is not None
+            else df.index.normalize()
+        )
+        last_close_by_date = df["close"].groupby(dates).last()
+        prior_close_by_date = last_close_by_date.shift(1).to_dict()
+        anchor = pd.Series(
+            [prior_close_by_date.get(d) for d in dates],
+            index=df.index,
+            dtype="float64",
+        )
+        # First session in the lookback has no prior close — fall back to that
+        # session's first-bar open so the value is still anchored to today
+        # rather than NaN (which downstream code would silently coerce to 0).
+        first_open = df["open"].groupby(dates).transform("first")
+        anchor = anchor.where(anchor.notna(), first_open)
+        return ((df["close"] - anchor) / anchor * 100.0).astype(float)
     return (df["close"].pct_change() * 100.0).astype(float)
 
 
