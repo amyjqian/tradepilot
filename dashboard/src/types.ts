@@ -104,6 +104,9 @@ export interface BrokerStatus {
    * has actually connected (lazy on first /broker/account call). */
   accounts?: string[]
   hint: string | null
+  /** Set when the server has TRADEPILOT_BROKER_DISABLED. Dashboard
+   * hides all broker UI and skips polling broker endpoints. */
+  disabled?: boolean
 }
 
 export interface AccountSnapshot {

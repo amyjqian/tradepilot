@@ -174,6 +174,8 @@ export function useBrokerData(): BrokerData {
         setError(String(e))
         setStatus({ connected: false, paper: null, hint: null })
       })
+    // Skip the connections list when broker is disabled — the endpoint
+    // would 200 with an empty list anyway, but no need to call it.
     fetchConnections()
       .then((list) => {
         if (cancelled) return
@@ -188,14 +190,18 @@ export function useBrokerData(): BrokerData {
   }, [])
 
   // Re-poll connections periodically so newly-connected TWS instances
-  // show up without a manual refresh. Cheap call (in-memory state).
+  // show up without a manual refresh. Skipped when broker is disabled
+  // — the disabled flag won't change during a session, so polling is
+  // pure noise (and a wasted HTTP request every 8s).
   useEffect(() => {
+    if (status?.disabled) return
     const id = window.setInterval(() => void refreshConnections(), 8_000)
     return () => window.clearInterval(id)
-  }, [refreshConnections])
+  }, [refreshConnections, status?.disabled])
 
-  // 2. SSE subscription — only if connected.
+  // 2. SSE subscription — only if connected (and broker isn't disabled).
   useEffect(() => {
+    if (status?.disabled) return
     if (!status?.connected) return
     cancelledRef.current = false
 

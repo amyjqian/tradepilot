@@ -8,10 +8,11 @@ import { RightRail } from './components/RightRail'
 import { LiveConfirmModal } from './components/LiveConfirmModal'
 import { ResizeHandle } from './components/ResizeHandle'
 import { ConnectView } from './components/ConnectView'
+import { ScoringView } from './components/ScoringView'
 import { WarningToasts } from './components/WarningToasts'
 import { useBrokerData } from './useBrokerData'
 
-type AppView = 'trade' | 'connect'
+type AppView = 'trade' | 'scoring' | 'connect'
 const VIEW_KEY = 'tradepilot.app_view'
 
 type Provider = 'synthetic' | 'yfinance' | 'ibkr' | 'polygon'
@@ -59,7 +60,8 @@ const DEFAULT_LOOKBACK: Record<Interval, number> = {
 export default function App() {
   const [view, setViewState] = useState<AppView>(() => {
     const saved = window.localStorage.getItem(VIEW_KEY)
-    return saved === 'connect' ? 'connect' : 'trade'
+    if (saved === 'connect' || saved === 'scoring') return saved
+    return 'trade'
   })
   const setView = (v: AppView) => {
     setViewState(v)
@@ -191,11 +193,22 @@ export default function App() {
         onError={setErr}
       />
 
-      <ViewTabs view={view} onChange={setView} />
+      <ViewTabs
+        view={view}
+        onChange={setView}
+        brokerDisabled={status?.disabled ?? false}
+      />
 
       <main className="min-h-0 flex-1">
-        {view === 'connect' ? (
+        {view === 'connect' && status?.disabled ? (
+          <div className="flex h-full items-center justify-center text-xs text-neutral-500">
+            Broker is disabled (TRADEPILOT_BROKER_DISABLED). Switch to Trade or
+            Scoring.
+          </div>
+        ) : view === 'connect' ? (
           <ConnectView onError={setErr} />
+        ) : view === 'scoring' ? (
+          <ScoringView provider={provider} />
         ) : (
           <PanelGroup
             direction="horizontal"
@@ -252,13 +265,17 @@ export default function App() {
 function ViewTabs({
   view,
   onChange,
+  brokerDisabled,
 }: {
   view: AppView
   onChange: (v: AppView) => void
+  brokerDisabled: boolean
 }) {
   const tabs: { id: AppView; label: string }[] = [
     { id: 'trade', label: 'Trade' },
-    { id: 'connect', label: 'Connect' },
+    { id: 'scoring', label: 'Scoring' },
+    // Connect tab is broker-only — hide when IBKR is disabled.
+    ...(brokerDisabled ? [] : [{ id: 'connect' as AppView, label: 'Connect' }]),
   ]
   return (
     <nav className="flex shrink-0 border-b border-neutral-800 bg-neutral-950">

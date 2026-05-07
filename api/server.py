@@ -17,6 +17,9 @@ import os
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, AsyncIterator
@@ -41,6 +44,14 @@ from scanner.data import MarketDataProvider, get_provider
 from scanner.data.ib_provider import PacingBudgetExhausted
 from scanner.diagnostics import warnings as _warning_bus
 from scanner.engine import scan
+from scanner.scoring import (
+    DisqualifierConfig,
+    GateThresholds,
+    ScoringWeights,
+    TierThresholds,
+)
+from scanner.scoring.builders import build_states
+from scanner.scoring.runner import ScannerRunner
 from scanner.sector_rotation import (
     SECTOR_ETFS,
     SPY_BENCHMARK,
@@ -56,6 +67,18 @@ if not logging.getLogger().handlers:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 logging.getLogger("scanner.data.polygon_quotes").setLevel(logging.INFO)
+logging.getLogger("scanner.scoring").setLevel(logging.INFO)
+logging.getLogger("scanner.scoring.builders").setLevel(logging.INFO)
+
+
+def _broker_disabled() -> bool:
+    """Read at request time so the user can flip it without restart by
+    rewriting .env (dev) or `kill -HUP` later. Set
+    `TRADEPILOT_BROKER_DISABLED=1` to skip IBKR auto-connect, hide
+    broker UI in the dashboard, and short-circuit broker endpoints."""
+    val = os.environ.get("TRADEPILOT_BROKER_DISABLED", "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
 
 app = FastAPI(title="TradePilot API", version="0.1.0")
 
@@ -93,6 +116,12 @@ class _State:
         self._connection_configs: list[ConnectionConfig] | None = None
         self._quote_streamer: Any = None
         self._quote_streamer_lock = threading.Lock()
+        # Per-scanner scoring runners. Keyed by a tuple of (provider, sorted
+        # ticker tuple) so different SSE clients with different watchlists
+        # get independent runners. Lazily started.
+        self._scoring_runners: dict[str, Any] = {}
+        self._scoring_runners_lock = threading.Lock()
+        self._scoring_feeds: dict[str, Any] = {}
 
     # -- multi-connection broker registry ----------------------------------
 
@@ -226,6 +255,95 @@ class _State:
                 self._quote_streamer = s
             return self._quote_streamer
 
+    def scoring_runner(
+        self,
+        *,
+        provider_name: str,
+        tickers: list[str],
+        attach_live_feed: bool,
+        cadence_seconds: float = 60.0,
+        halt_lookback_seconds: float = 120.0,
+    ) -> tuple[Any, str]:
+        """Lazy singleton scoring runner for a (provider, tickers, cadence) tuple.
+
+        Bootstraps state via `build_states` on first request. If
+        `attach_live_feed` is True, also subscribes to the shared Polygon
+        WebSocket so 1m bars and quotes flow into the runner state. The
+        runner's asyncio cycle loop is started on the calling event loop.
+
+        The cache key includes `cadence_seconds` so a Watchlist@5m and
+        Watchlist@15m produce two distinct runners (otherwise the second
+        client gets the first's cadence).
+
+        `halt_lookback_seconds` widens the heuristic halt threshold for
+        the live path. The spec's 30s default assumes real exchange halt
+        data; we approximate from "time since last closed 1m bar." A
+        Polygon AM event for minute N's close arrives a few seconds into
+        minute N+1, so a 5m or 15m cycle that fires right around a minute
+        boundary can see `now - last_bar ≈ 60s` and false-positive at
+        30s. 120s is generous enough to absorb that lag while still
+        flagging real halts (>2 min of no prints).
+        """
+        from scanner.scoring.builders import build_states
+        from scanner.scoring.config import GateThresholds
+        from scanner.scoring.feeds import PolygonRunnerFeed
+        from scanner.scoring.runner import ScannerRunner
+
+        cadence_tag = f"{int(cadence_seconds)}s"
+        key = f"{provider_name}|{cadence_tag}|{','.join(sorted(tickers))}"
+        with self._scoring_runners_lock:
+            existing = self._scoring_runners.get(key)
+            if existing is not None:
+                return existing, key
+
+            provider = self.provider(provider_name)
+            states = build_states(provider, tickers)
+            runner = ScannerRunner(
+                scanner_id=key,
+                refresh_interval_seconds=cadence_seconds,
+                gates=GateThresholds(halt_lookback_seconds=halt_lookback_seconds),
+                # Live cycles fire at clock-aligned cadence boundaries
+                # plus a 5s lag so Polygon's AM event for the just-closed
+                # bar has time to arrive before we score against it.
+                align_to_boundary=True,
+                boundary_lag_seconds=5.0,
+            )
+            for state in states.values():
+                runner.add_symbol(state)
+
+            if attach_live_feed:
+                try:
+                    streamer = self.quote_streamer()
+                    feed = PolygonRunnerFeed(streamer, runner)
+                    feed.start()
+                    self._scoring_feeds[key] = feed
+                except Exception:
+                    log.exception("Scoring live feed could not be attached for %s", key)
+
+            self._scoring_runners[key] = runner
+            return runner, key
+
+    def stop_scoring_runners(self) -> None:
+        with self._scoring_runners_lock:
+            runners = list(self._scoring_runners.items())
+            feeds = list(self._scoring_feeds.items())
+            self._scoring_runners.clear()
+            self._scoring_feeds.clear()
+        for _, feed in feeds:
+            try:
+                feed.stop()
+            except Exception:
+                log.debug("Scoring feed stop failed", exc_info=True)
+        for _, runner in runners:
+            try:
+                stop = getattr(runner, "stop", None)
+                if stop is not None:
+                    # ScannerRunner.stop is async; best-effort fire-and-
+                    # forget on whichever loop is current.
+                    asyncio.get_event_loop().run_until_complete(stop())
+            except Exception:
+                log.debug("Scoring runner stop failed", exc_info=True)
+
     def cache_get(self, key: str) -> dict[str, Any] | None:
         with self._cache_lock:
             hit = self._cache.get(key)
@@ -303,7 +421,15 @@ _CACHE_DIR = Path(
 def _on_startup() -> None:
     """Pre-instantiate auto-connect brokers so aggregating reads
     (positions across all connections) see every configured connection
-    on the very first call. Each broker's TCP connect remains lazy."""
+    on the very first call. Each broker's TCP connect remains lazy.
+
+    Skipped when `TRADEPILOT_BROKER_DISABLED` is set — the dashboard
+    will hide all broker UI and the API's broker endpoints will return
+    a disabled-state payload.
+    """
+    if _broker_disabled():
+        log.info("Broker disabled via TRADEPILOT_BROKER_DISABLED — skipping eager init")
+        return
     try:
         _state.eager_init_auto_connect()
     except Exception:
@@ -341,6 +467,77 @@ class SectorRotationRequest(BaseModel):
 
 class WatchlistRequest(BaseModel):
     tickers: list[str]
+
+
+class ScoringScanRequest(BaseModel):
+    """Request for the per-minute scoring engine (`/scoring/scan`)."""
+
+    provider: str = Field(default="polygon")
+    tickers: list[str] | None = None
+    top_n: int = Field(default=50, ge=1, le=500)
+    # Hard ceiling so a misbehaving provider can't hang the dashboard.
+    # Returns 504 when exceeded.
+    timeout_sec: float = Field(default=45.0, ge=1.0, le=600.0)
+    intraday_lookback_days: int = Field(default=5, ge=1, le=30)
+    weights: dict[str, float] | None = None
+    gates: dict[str, float] | None = None
+    tiers: dict[str, float] | None = None
+
+
+class ScoringScanMultiRequest(BaseModel):
+    """Request for the multi-cadence scoring endpoint.
+
+    For each cadence in `cadences`, the engine evaluates state at the
+    most recent cadence boundary (anchored to today's 09:30 ET session
+    start), truncating bars accordingly. This produces meaningfully
+    different rankings per cadence in one-shot mode — without it, all
+    cadences would see identical in-progress bars and score identically.
+
+    `eval_at_ms` enables verification mode: pin the evaluation timestamp
+    to a chosen past moment instead of `now`. The intraday lookback is
+    auto-extended to cover the history gap, and the session anchor
+    rebases to the calendar day containing `eval_at_ms`.
+    """
+
+    provider: str = Field(default="polygon")
+    tickers: list[str] | None = None
+    top_n: int = Field(default=50, ge=1, le=500)
+    cadences: list[int] = Field(default_factory=lambda: [60, 120, 300, 900])
+    timeout_sec: float = Field(default=60.0, ge=1.0, le=600.0)
+    intraday_lookback_days: int = Field(default=5, ge=1, le=120)
+    eval_at_ms: int | None = None
+    weights: dict[str, float] | None = None
+    gates: dict[str, float] | None = None
+    tiers: dict[str, float] | None = None
+
+
+class ScoringSectorScanRequest(BaseModel):
+    """Request for the sector-driven per-minute scan (`/scoring/sector-scan`).
+
+    Stage 1: rank `SECTOR_ETFS` by 5-bar relative strength + trend bonus.
+    Stage 2: score the top `top_sectors` sectors' pooled constituents
+    using the same cadence-boundary logic as `/scoring/scan-multi` —
+    each cadence evaluates at its most recent boundary so 1m/2m/5m/15m
+    panels show meaningfully different rankings.
+
+    `eval_at_ms` enables verify mode (same semantics as scan-multi):
+    evaluate at a chosen past timestamp instead of `now`. Sector ranking
+    itself still uses daily bars ending at real-now (sector trends move
+    on a daily timescale; not worth backfilling daily history to a
+    verify date).
+    """
+
+    provider: str = Field(default="polygon")
+    top_sectors: int = Field(default=2, ge=1, le=11)
+    sector_lookback_days: int = Field(default=10, ge=5, le=60)
+    top_n: int = Field(default=50, ge=1, le=500)
+    cadences: list[int] = Field(default_factory=lambda: [60, 120, 300, 900])
+    eval_at_ms: int | None = None
+    timeout_sec: float = Field(default=60.0, ge=1.0, le=600.0)
+    intraday_lookback_days: int = Field(default=5, ge=1, le=120)
+    weights: dict[str, float] | None = None
+    gates: dict[str, float] | None = None
+    tiers: dict[str, float] | None = None
 
 
 class OrderTarget(BaseModel):
@@ -580,6 +777,582 @@ def post_scan(req: ScanRequest) -> dict[str, Any]:
     }
     _state.cache_put(cache_key, payload)
     return payload
+
+
+class _ScoringTimeout(RuntimeError):
+    """Raised when build_states exceeds the request's timeout_sec budget."""
+
+
+def _run_with_timeout(fn: Callable[[], Any], *, timeout_sec: float) -> Any:
+    """Run `fn` on a worker thread with a hard wall-clock cap.
+
+    The worker thread keeps running after timeout (we can't kill native
+    threads in Python) but the request returns 504 so the dashboard
+    doesn't hang. Background workers eventually finish and exit.
+    """
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn)
+        try:
+            return fut.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError as exc:
+            raise _ScoringTimeout(
+                f"scoring scan exceeded {timeout_sec:.0f}s timeout — "
+                f"check Polygon connectivity / rate limits / watchlist size"
+            ) from exc
+
+
+def _score_result_to_dict(r: Any) -> dict[str, Any]:
+    return {
+        "symbol": r.symbol,
+        "timestamp": r.timestamp,
+        "base_score": r.base_score,
+        "tod_mult": r.tod_mult,
+        "final_score": r.final_score,
+        "bias_15m": r.bias_15m,
+        "tier": r.tier,
+        "flags": list(r.flags),
+        "components": {
+            name: {
+                "name": c.name,
+                "strength": c.strength,
+                "raw": c.raw,
+            }
+            for name, c in r.components.items()
+        },
+    }
+
+
+@app.post("/scoring/scan")
+def post_scoring_scan(req: ScoringScanRequest) -> dict[str, Any]:
+    """One-shot run of the per-minute scoring engine.
+
+    Pulls daily + 1m bars for each ticker via the existing provider, builds
+    a `SymbolState` with seeded today's session, runs `score_symbol` for
+    each, and returns rankings sorted by `final_score`. No caching — each
+    call evaluates against the latest data.
+    """
+    tickers = (
+        [t.upper() for t in req.tickers]
+        if req.tickers
+        else list(_state.config.default_tickers)
+    )
+    log.info(
+        "/scoring/scan: provider=%s tickers=%d top_n=%d",
+        req.provider, len(tickers), req.top_n,
+    )
+    t_start = time.perf_counter()
+    try:
+        provider = _state.provider(req.provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        weights = ScoringWeights(**req.weights) if req.weights else ScoringWeights()
+        # One-shot scans run on Polygon's REST data, which lags real-time
+        # by 60–120s (REST only returns closed minute bars). The default
+        # 30s halt heuristic is calibrated for the live WebSocket runner
+        # and would flag every symbol as "halted_recently" on REST data.
+        # Bump to 600s here unless the caller explicitly overrides.
+        gate_overrides = dict(req.gates or {})
+        gate_overrides.setdefault("halt_lookback_seconds", 600.0)
+        gates = GateThresholds(**gate_overrides)
+        tiers = TierThresholds(**req.tiers) if req.tiers else TierThresholds()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {exc}") from exc
+
+    try:
+        states = _run_with_timeout(
+            lambda: build_states(provider, tickers, intraday_lookback_days=req.intraday_lookback_days),
+            timeout_sec=req.timeout_sec,
+        )
+    except _ScoringTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except PacingBudgetExhausted as exc:
+        retry = max(1, int(round(exc.retry_after_sec)))
+        raise HTTPException(
+            status_code=429, detail=str(exc), headers={"Retry-After": str(retry)}
+        ) from exc
+    except Exception as exc:
+        log.exception("Scoring data fetch failed")
+        raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc!r}") from exc
+
+    runner = ScannerRunner(
+        scanner_id="oneshot",
+        weights=weights,
+        gates=gates,
+        tier_thresholds=tiers,
+        dq_config=DisqualifierConfig(),
+        top_n=req.top_n,
+    )
+    for state in states.values():
+        runner.add_symbol(state)
+
+    t_score = time.perf_counter()
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    rankings, rejected = runner.score_all_diagnostic(now_ms)
+
+    # Aggregate which gate / DQ filters fired most often. The dashboard
+    # uses this to tell the user "21 symbols failed atr_pct_20d" rather
+    # than just showing an empty results table.
+    reason_counts: dict[str, int] = {}
+    for rej in rejected:
+        for reason in rej.reasons:
+            tag = reason.split(" ", 1)[0]
+            reason_counts[tag] = reason_counts.get(tag, 0) + 1
+
+    log.info(
+        "/scoring/scan: scored %d → %d ranked, %d rejected in %.2fs (total %.2fs)",
+        len(states), len(rankings), len(rejected),
+        time.perf_counter() - t_score, time.perf_counter() - t_start,
+    )
+    if reason_counts:
+        log.info("/scoring/scan rejection reasons: %s",
+                 sorted(reason_counts.items(), key=lambda x: -x[1]))
+
+    return {
+        "ran_at": datetime.now(UTC).isoformat(),
+        "provider": req.provider,
+        "n_candidates_scanned": len(states),
+        "n_results": len(rankings),
+        "n_rejected": len(rejected),
+        "rejection_summary": [
+            {"reason": k, "count": v}
+            for k, v in sorted(reason_counts.items(), key=lambda x: -x[1])
+        ],
+        "rankings": [_score_result_to_dict(r) for r in rankings],
+        "rejected": [
+            {"symbol": rej.symbol, "reasons": list(rej.reasons)}
+            for rej in rejected
+        ],
+    }
+
+
+@app.post("/scoring/scan-multi")
+def post_scoring_scan_multi(req: ScoringScanMultiRequest) -> dict[str, Any]:
+    """Run the engine at each cadence's most-recent boundary.
+
+    Single backend fetch, multiple evaluation timestamps. The dashboard's
+    4-panel cadence view consumes this so each panel's ranking is
+    genuinely cadence-aware (not just the same one-shot snapshot).
+    """
+    from scanner.scoring.builders import session_start_ms as session_start_ms_for
+    from scanner.scoring.runner import most_recent_cadence_boundary
+
+    log.info(
+        "/scoring/scan-multi: provider=%s cadences=%s top_n=%d",
+        req.provider, req.cadences, req.top_n,
+    )
+    t_start = time.perf_counter()
+    tickers = (
+        [t.upper() for t in req.tickers]
+        if req.tickers
+        else list(_state.config.default_tickers)
+    )
+    try:
+        provider = _state.provider(req.provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        weights = ScoringWeights(**req.weights) if req.weights else ScoringWeights()
+        gate_overrides = dict(req.gates or {})
+        gate_overrides.setdefault("halt_lookback_seconds", 600.0)
+        gates = GateThresholds(**gate_overrides)
+        tiers = TierThresholds(**req.tiers) if req.tiers else TierThresholds()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {exc}") from exc
+
+    # Verification mode: pin the evaluation moment. Today rebases to the
+    # ET calendar day containing `eval_at_ms`, and the intraday lookback
+    # auto-extends (capped at 30d) so the fetched 1m history reaches
+    # that day. Users wanting verification farther back than 30 days can
+    # set `intraday_lookback_days` explicitly above the cap.
+    real_now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    if req.eval_at_ms is not None:
+        actual_now_ms = int(req.eval_at_ms)
+        eval_dt_et = datetime.fromtimestamp(actual_now_ms / 1000, tz=ET)
+        today_date = eval_dt_et.date()
+        gap_days = max(0, (datetime.now(ET).date() - today_date).days)
+        auto_lookback = min(gap_days + 5, 30)
+        intraday_lookback = max(req.intraday_lookback_days, auto_lookback)
+        log.info(
+            "/scoring/scan-multi: verify mode @ %s ET (gap=%dd, lookback=%dd)",
+            eval_dt_et.isoformat(), gap_days, intraday_lookback,
+        )
+    else:
+        actual_now_ms = real_now_ms
+        today_date = datetime.now(ET).date()
+        intraday_lookback = req.intraday_lookback_days
+
+    try:
+        full_states = _run_with_timeout(
+            lambda: build_states(
+                provider,
+                tickers,
+                today=today_date,
+                intraday_lookback_days=intraday_lookback,
+                # In verify mode, tell build_states the eval timestamp
+                # so the cached provider can short-circuit Polygon delta
+                # fetches when the on-disk cache already extends past
+                # this moment. Repeated verify clicks at the same past
+                # `eval_at_ms` become fully cache-served after the first.
+                eval_at_ms=req.eval_at_ms,
+            ),
+            timeout_sec=req.timeout_sec,
+        )
+    except _ScoringTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except PacingBudgetExhausted as exc:
+        retry = max(1, int(round(exc.retry_after_sec)))
+        raise HTTPException(
+            status_code=429, detail=str(exc), headers={"Retry-After": str(retry)},
+        ) from exc
+    except Exception as exc:
+        log.exception("Multi-cadence data fetch failed")
+        raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc!r}") from exc
+
+    today_session_ms = session_start_ms_for(today_date)
+
+    panels: dict[str, Any] = {}
+    for cadence_secs in req.cadences:
+        eval_ms = most_recent_cadence_boundary(
+            actual_now_ms, cadence_secs, today_session_ms
+        )
+        runner = ScannerRunner(
+            scanner_id=f"multi-{cadence_secs}",
+            weights=weights, gates=gates, tier_thresholds=tiers,
+            dq_config=DisqualifierConfig(), top_n=req.top_n,
+        )
+        for state in full_states.values():
+            runner.add_symbol(state.truncate_to(eval_ms))
+        rankings, rejected = runner.score_all_diagnostic(eval_ms)
+        reason_counts: dict[str, int] = {}
+        for rej in rejected:
+            for reason in rej.reasons:
+                tag = reason.split(" ", 1)[0]
+                reason_counts[tag] = reason_counts.get(tag, 0) + 1
+        panels[str(cadence_secs)] = {
+            "cadence_seconds": cadence_secs,
+            "eval_ms": eval_ms,
+            "n_candidates_scanned": len(full_states),
+            "n_results": len(rankings),
+            "n_rejected": len(rejected),
+            "rankings": [_score_result_to_dict(r) for r in rankings],
+            "rejected": [
+                {"symbol": rej.symbol, "reasons": list(rej.reasons)}
+                for rej in rejected
+            ],
+            "rejection_summary": [
+                {"reason": k, "count": v}
+                for k, v in sorted(reason_counts.items(), key=lambda x: -x[1])
+            ],
+        }
+
+    log.info(
+        "/scoring/scan-multi done: %d panels in %.2fs",
+        len(panels), time.perf_counter() - t_start,
+    )
+
+    return {
+        "ran_at": datetime.now(UTC).isoformat(),
+        "provider": req.provider,
+        "now_ms": actual_now_ms,
+        "session_start_ms": today_session_ms,
+        "verify_mode": req.eval_at_ms is not None,
+        "panels": panels,
+    }
+
+
+@app.post("/scoring/sector-scan")
+def post_scoring_sector_scan(req: ScoringSectorScanRequest) -> dict[str, Any]:
+    """Two-stage per-minute scan: rank sectors, score top sectors' constituents.
+
+    Stage 1 reuses the daily-bar sector rotation logic (`rank_sectors`)
+    against the 11 SPDR sector ETFs, ranked by 5-bar relative strength
+    vs SPY plus a trend bonus.
+
+    Stage 2 takes the constituents of the top `top_sectors` sectors
+    (deduped, preserving sector order) and runs the per-minute scoring
+    engine on them — same gates / weights / DQ as `/scoring/scan`.
+    """
+    log.info(
+        "/scoring/sector-scan: provider=%s top_sectors=%d top_n=%d",
+        req.provider, req.top_sectors, req.top_n,
+    )
+    t_start = time.perf_counter()
+    try:
+        provider = _state.provider(req.provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        weights = ScoringWeights(**req.weights) if req.weights else ScoringWeights()
+        gate_overrides = dict(req.gates or {})
+        gate_overrides.setdefault("halt_lookback_seconds", 600.0)
+        gates = GateThresholds(**gate_overrides)
+        tiers = TierThresholds(**req.tiers) if req.tiers else TierThresholds()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {exc}") from exc
+
+    # --- Stage 1: rank sectors on daily bars --------------------------------
+    sector_tickers = list(SECTOR_ETFS.keys()) + [SPY_BENCHMARK]
+    try:
+        sector_data = _run_with_timeout(
+            lambda: provider.get_bars_batch(
+                sector_tickers, "1d", req.sector_lookback_days
+            ),
+            timeout_sec=req.timeout_sec,
+        )
+    except _ScoringTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except PacingBudgetExhausted as exc:
+        retry = max(1, int(round(exc.retry_after_sec)))
+        raise HTTPException(
+            status_code=429, detail=str(exc), headers={"Retry-After": str(retry)},
+        ) from exc
+    except Exception as exc:
+        log.exception("Sector ETF fetch failed")
+        raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc!r}") from exc
+    spy_df = sector_data.pop(SPY_BENCHMARK, None)
+
+    from scanner.sector_rotation import rank_sectors
+
+    ranked = rank_sectors(sector_data, spy_df)
+    if not ranked:
+        raise HTTPException(status_code=502, detail="Sector ranking returned no rows")
+    n = max(1, min(req.top_sectors, len(ranked)))
+    tops = ranked[:n]
+
+    # --- Stage 2: pool top sectors' constituents and score them -------------
+    constituents_map, source = get_active_constituents()
+    log.info("/scoring/sector-scan: constituents source=%s", source)
+    # Dedup *only* for the unified scoring list (so cross-listed names
+    # don't score twice). The per-sector display map uses the raw
+    # holdings — matching the legacy `/scan/sector-rotation` behavior in
+    # `run_sector_rotation()` so the dashboard's sector chips show each
+    # ETF's full holding list.
+    seen: set[str] = set()
+    constituents: list[str] = []
+    for top in tops:
+        for ticker in constituents_map.get(top.etf, []):
+            if ticker not in seen:
+                seen.add(ticker)
+                constituents.append(ticker)
+    constituents_by_sector: dict[str, list[str]] = {
+        top.etf: list(constituents_map.get(top.etf, [])) for top in tops
+    }
+
+    # --- Verify-mode rebasing (same semantics as /scoring/scan-multi) ----
+    from scanner.scoring.builders import session_start_ms as session_start_ms_for
+    from scanner.scoring.runner import most_recent_cadence_boundary
+
+    if req.eval_at_ms is not None:
+        actual_now_ms = int(req.eval_at_ms)
+        eval_dt_et = datetime.fromtimestamp(actual_now_ms / 1000, tz=ET)
+        today_date = eval_dt_et.date()
+        gap_days = max(0, (datetime.now(ET).date() - today_date).days)
+        auto_lookback = min(gap_days + 5, 30)
+        intraday_lookback = max(req.intraday_lookback_days, auto_lookback)
+        log.info(
+            "/scoring/sector-scan: verify mode @ %s ET (gap=%dd, lookback=%dd)",
+            eval_dt_et.isoformat(), gap_days, intraday_lookback,
+        )
+    else:
+        actual_now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        today_date = datetime.now(ET).date()
+        intraday_lookback = req.intraday_lookback_days
+    today_session_ms = session_start_ms_for(today_date)
+
+    sectors_payload = _sectors_payload(ranked, tops, constituents_by_sector)
+
+    if not constituents:
+        return {
+            "ran_at": datetime.now(UTC).isoformat(),
+            "provider": req.provider,
+            "now_ms": actual_now_ms,
+            "session_start_ms": today_session_ms,
+            "verify_mode": req.eval_at_ms is not None,
+            "panels": {},
+            "sectors": sectors_payload,
+        }
+
+    log.info(
+        "/scoring/sector-scan: scoring %d constituents from sectors %s",
+        len(constituents), [t.etf for t in tops],
+    )
+    try:
+        full_states = _run_with_timeout(
+            lambda: build_states(
+                provider,
+                constituents,
+                today=today_date,
+                intraday_lookback_days=intraday_lookback,
+                eval_at_ms=req.eval_at_ms,
+            ),
+            timeout_sec=req.timeout_sec,
+        )
+    except _ScoringTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except PacingBudgetExhausted as exc:
+        retry = max(1, int(round(exc.retry_after_sec)))
+        raise HTTPException(
+            status_code=429, detail=str(exc), headers={"Retry-After": str(retry)},
+        ) from exc
+    except Exception as exc:
+        log.exception("Constituent fetch failed")
+        raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc!r}") from exc
+
+    panels: dict[str, Any] = {}
+    for cadence_secs in req.cadences:
+        eval_ms = most_recent_cadence_boundary(
+            actual_now_ms, cadence_secs, today_session_ms
+        )
+        runner = ScannerRunner(
+            scanner_id=f"sector-{cadence_secs}",
+            weights=weights, gates=gates, tier_thresholds=tiers,
+            dq_config=DisqualifierConfig(), top_n=req.top_n,
+        )
+        for state in full_states.values():
+            runner.add_symbol(state.truncate_to(eval_ms))
+        rankings, rejected = runner.score_all_diagnostic(eval_ms)
+        reason_counts: dict[str, int] = {}
+        for rej in rejected:
+            for reason in rej.reasons:
+                tag = reason.split(" ", 1)[0]
+                reason_counts[tag] = reason_counts.get(tag, 0) + 1
+        panels[str(cadence_secs)] = {
+            "cadence_seconds": cadence_secs,
+            "eval_ms": eval_ms,
+            "n_candidates_scanned": len(full_states),
+            "n_results": len(rankings),
+            "n_rejected": len(rejected),
+            "rankings": [_score_result_to_dict(r) for r in rankings],
+            "rejected": [
+                {"symbol": rej.symbol, "reasons": list(rej.reasons)}
+                for rej in rejected
+            ],
+            "rejection_summary": [
+                {"reason": k, "count": v}
+                for k, v in sorted(reason_counts.items(), key=lambda x: -x[1])
+            ],
+        }
+
+    log.info(
+        "/scoring/sector-scan done: %d cadences, %d states, total %.2fs",
+        len(panels), len(full_states), time.perf_counter() - t_start,
+    )
+
+    return {
+        "ran_at": datetime.now(UTC).isoformat(),
+        "provider": req.provider,
+        "now_ms": actual_now_ms,
+        "session_start_ms": today_session_ms,
+        "verify_mode": req.eval_at_ms is not None,
+        "panels": panels,
+        "sectors": sectors_payload,
+    }
+
+
+def _sectors_payload(
+    ranked: list[Any],
+    tops: list[Any],
+    constituents_by_sector: dict[str, list[str]],
+) -> dict[str, Any]:
+    return {
+        "ranked": [r.to_dict() for r in ranked],
+        "top_etfs": [t.etf for t in tops],
+        "top_names": [t.name for t in tops],
+        "constituents_by_sector": constituents_by_sector,
+    }
+
+
+@app.get("/scoring/stream")
+async def scoring_stream(
+    provider: str = "polygon",
+    tickers: str | None = None,
+    live: bool = True,
+    cadence_seconds: float = 60.0,
+    halt_lookback_seconds: float = 120.0,
+) -> StreamingResponse:
+    """SSE stream of `RankingsUpdate` events from the scoring engine.
+
+    Query params:
+      - `provider`: data source (default `polygon`)
+      - `tickers`: comma-separated; defaults to the active config watchlist
+      - `live`: when true (default) attach the shared Polygon WS so the
+        runner state stays current; when false, run cycles against the
+        bars seeded at bootstrap (useful for synthetic providers and tests)
+      - `cadence_seconds`: how often the runner re-scores. Spec-supported
+        values are 60 (1m), 120 (2m), 300 (5m), 900 (15m). The math is
+        identical at every cadence; only the refresh interval changes.
+        Different (provider, tickers, cadence) tuples each get their own
+        runner instance.
+    """
+    ticker_list = (
+        [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        if tickers
+        else list(_state.config.default_tickers)
+    )
+    if not ticker_list:
+        raise HTTPException(status_code=400, detail="No tickers configured")
+
+    try:
+        runner, _key = _state.scoring_runner(
+            provider_name=provider,
+            tickers=ticker_list,
+            attach_live_feed=live and provider == "polygon",
+            cadence_seconds=cadence_seconds,
+            halt_lookback_seconds=halt_lookback_seconds,
+        )
+    except Exception as exc:
+        log.exception("Scoring runner bootstrap failed")
+        raise HTTPException(
+            status_code=502, detail=f"Scoring runner bootstrap failed: {exc!r}"
+        ) from exc
+
+    runner.start()  # idempotent — no-op if already running
+    queue = runner.subscribe()
+
+    async def event_gen() -> AsyncIterator[str]:
+        try:
+            # Emit one snapshot immediately so the client doesn't have to
+            # wait a full cycle for first paint.
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
+            initial = runner.score_all(now_ms)
+            snapshot_payload = {
+                "rankings": [_score_result_to_dict(r) for r in initial],
+                "cadence_seconds": cadence_seconds,
+            }
+            yield f"event: snapshot\ndata: {json.dumps(snapshot_payload)}\n\n"
+            while True:
+                try:
+                    update = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    payload = {
+                        "scanner_id": update.scanner_id,
+                        "timestamp_ms": update.timestamp_ms,
+                        "cadence_seconds": cadence_seconds,
+                        "rankings": [_score_result_to_dict(r) for r in update.rankings],
+                        "rejected": [
+                            {"symbol": rej.symbol, "reasons": list(rej.reasons)}
+                            for rej in update.rejected
+                        ],
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            runner.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/backtest")
@@ -954,7 +1727,21 @@ def broker_status() -> dict[str, Any]:
     existing single-connection dashboard keeps working unchanged), plus
     a `connections: [...]` array with details for every configured
     connection — the new multi-connection UI reads from there.
+
+    When `TRADEPILOT_BROKER_DISABLED` is set, returns a disabled-state
+    payload so the dashboard can hide broker UI cleanly without polling
+    other broker endpoints.
     """
+    if _broker_disabled():
+        return {
+            "connected": False,
+            "disabled": True,
+            "paper": None,
+            "accounts": [],
+            "default_account": None,
+            "hint": "Broker disabled via TRADEPILOT_BROKER_DISABLED env var.",
+            "connections": [],
+        }
     configs = _state.list_connections()
     if not configs:
         return {
@@ -1840,9 +2627,13 @@ def quotes_history(
             "bars": [],
         }
     except Exception as exc:
-        log.warning("quotes_history failed for %s: %s", sym, exc)
+        log.warning(
+            "quotes_history failed for %s (%s): %s",
+            sym, type(exc).__name__, exc,
+        )
         raise HTTPException(
-            status_code=502, detail=f"history fetch failed: {exc!r}"
+            status_code=502,
+            detail=f"history fetch failed ({type(exc).__name__}): {exc}",
         ) from exc
 
     bars: list[dict[str, Any]] = []

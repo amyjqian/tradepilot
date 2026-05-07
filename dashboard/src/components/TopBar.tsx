@@ -107,7 +107,11 @@ export function TopBar({
           )}
         </div>
 
-        <AccountStrip account={account} connected={connected} />
+        <AccountStrip
+          account={account}
+          connected={connected}
+          disabled={brokerStatus?.disabled ?? false}
+        />
         {connected && risk?.enabled && (
           <DrawdownPill risk={risk} onReset={onResetRisk} onError={onError} />
         )}
@@ -201,15 +205,17 @@ export function TopBar({
 function AccountStrip({
   account,
   connected,
+  disabled,
 }: {
   account: AccountSnapshot | null
   connected: boolean
+  disabled: boolean
 }) {
   if (!connected) {
     return (
       <div className="flex items-center gap-2 text-[10px] uppercase tracking-wide text-neutral-500">
         <span className="rounded border border-neutral-700 px-1.5 py-0.5">
-          Broker not connected
+          {disabled ? 'Broker disabled' : 'Broker not connected'}
         </span>
       </div>
     )
