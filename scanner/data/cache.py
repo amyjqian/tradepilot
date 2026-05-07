@@ -354,3 +354,56 @@ class CachedProvider(MarketDataProvider):
         if pacing_exc is not None and not out:
             raise pacing_exc
         return out
+
+    def get_bars_batch_complete_through(
+        self,
+        tickers: list[str],
+        interval: str,
+        lookback_days: int,
+        complete_through: pd.Timestamp,
+    ) -> dict[str, pd.DataFrame]:
+        """Variant of `get_bars_batch` for verify-mode scoring.
+
+        For each ticker, if the on-disk cache already contains bars
+        whose latest timestamp is at-or-after `complete_through` AND
+        the left edge covers `lookback_days`, the cached frame is
+        served regardless of TTL — no delta fetch is needed because
+        the engine only consumes bars up to the eval timestamp anyway.
+        Tickers that don't satisfy the coverage check fall back to the
+        normal `get_bars_batch` path (delta-fetched as usual).
+
+        This is the optimization that makes repeated verify clicks at
+        the same past timestamp completely cache-served — without it,
+        every verify >60s apart triggers a Polygon delta fetch for bars
+        the engine then discards via `truncate_to`.
+        """
+        out: dict[str, pd.DataFrame] = {}
+        fallback: list[str] = []
+        now = pd.Timestamp.now(tz="UTC")
+        wanted_start = now - pd.Timedelta(days=lookback_days)
+        for t in tickers:
+            cached = self._cache.get(t, interval)
+            if (
+                cached is None
+                or cached.empty
+                or cached.index[0] > wanted_start + _LEFT_EDGE_SLACK
+                or cached.index[-1] < complete_through
+            ):
+                fallback.append(t)
+                continue
+            out[t] = self._trim(cached, lookback_days)
+        if not fallback:
+            log.info(
+                "Cache fully served %d/%d tickers for %s through %s "
+                "(verify-mode, no wrapped fetch)",
+                len(out), len(tickers), interval, complete_through.isoformat(),
+            )
+            return out
+        log.info(
+            "Cache served %d/%d tickers for %s; %d need delta (verify-mode "
+            "complete_through %s not covered)",
+            len(out), len(tickers), interval, len(fallback),
+            complete_through.isoformat(),
+        )
+        out.update(self.get_bars_batch(fallback, interval, lookback_days))
+        return out

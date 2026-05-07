@@ -366,6 +366,192 @@ export async function fetchJournalStats(): Promise<JournalStats> {
   return res.json() as Promise<JournalStats>
 }
 
+export interface ScoringComponent {
+  name: string
+  strength: number
+  raw: number | null
+}
+
+export interface ScoringResult {
+  symbol: string
+  timestamp: number
+  base_score: number
+  tod_mult: number
+  final_score: number
+  bias_15m: 'long' | 'short' | 'neutral'
+  tier: 'A' | 'B' | 'C' | null
+  flags: string[]
+  components: Record<string, ScoringComponent>
+}
+
+export interface ScoringRejection {
+  symbol: string
+  reasons: string[]
+}
+
+export interface ScoringRejectionSummaryEntry {
+  reason: string
+  count: number
+}
+
+export interface ScoringScanResponse {
+  ran_at: string
+  provider: string
+  n_candidates_scanned: number
+  n_results: number
+  n_rejected: number
+  rankings: ScoringResult[]
+  rejected: ScoringRejection[]
+  rejection_summary: ScoringRejectionSummaryEntry[]
+}
+
+export async function runScoringScan(
+  provider: string,
+  options: { tickers?: string[]; top_n?: number } = {},
+): Promise<ScoringScanResponse> {
+  return post<ScoringScanResponse>('/scoring/scan', {
+    provider,
+    ...(options.tickers ? { tickers: options.tickers } : {}),
+    ...(options.top_n ? { top_n: options.top_n } : {}),
+  })
+}
+
+export interface SectorRankEntry {
+  etf: string
+  name: string
+  score: number
+  pct_change_1: number
+  pct_change_5: number
+  excess_return_5_vs_spy: number
+  above_ema20: boolean
+}
+
+export interface ScoringSectorScanResponse {
+  ran_at: string
+  provider: string
+  now_ms: number
+  session_start_ms: number
+  verify_mode?: boolean
+  /** Per-cadence rankings (same shape as `ScoringScanMultiResponse.panels`).
+   * Sector-scan now mirrors scan-multi for consistent boundary/verify
+   * behavior; the only addition is the `sectors` block. */
+  panels: Record<string, ScoringPanelResult>
+  sectors: {
+    ranked: SectorRankEntry[]
+    top_etfs: string[]
+    top_names: string[]
+    constituents_by_sector: Record<string, string[]>
+  }
+}
+
+export async function runScoringSectorScan(
+  provider: string,
+  options: {
+    top_sectors?: number
+    top_n?: number
+    cadences?: number[]
+    eval_at_ms?: number
+  } = {},
+): Promise<ScoringSectorScanResponse> {
+  return post<ScoringSectorScanResponse>('/scoring/sector-scan', {
+    provider,
+    ...(options.top_sectors ? { top_sectors: options.top_sectors } : {}),
+    ...(options.top_n ? { top_n: options.top_n } : {}),
+    ...(options.cadences ? { cadences: options.cadences } : {}),
+    ...(options.eval_at_ms !== undefined ? { eval_at_ms: options.eval_at_ms } : {}),
+  })
+}
+
+export interface ScoringPanelResult {
+  cadence_seconds: number
+  eval_ms: number
+  n_candidates_scanned: number
+  n_results: number
+  n_rejected: number
+  rankings: ScoringResult[]
+  rejected: ScoringRejection[]
+  rejection_summary: ScoringRejectionSummaryEntry[]
+}
+
+export interface ScoringScanMultiResponse {
+  ran_at: string
+  provider: string
+  now_ms: number
+  session_start_ms: number
+  verify_mode?: boolean
+  /** Keys are cadence_seconds as strings (`"60"`, `"120"`, ...) since
+   * JSON object keys are always strings. */
+  panels: Record<string, ScoringPanelResult>
+}
+
+export async function runScoringScanMulti(
+  provider: string,
+  options: {
+    tickers?: string[]
+    top_n?: number
+    cadences?: number[]
+    /** Optional verification timestamp (epoch ms). When set, the engine
+     * pins evaluation to that moment instead of `now`. */
+    eval_at_ms?: number
+    /** Override the default 5-day intraday lookback; useful for verify
+     * mode farther than ~25 days back. */
+    intraday_lookback_days?: number
+  } = {},
+): Promise<ScoringScanMultiResponse> {
+  return post<ScoringScanMultiResponse>('/scoring/scan-multi', {
+    provider,
+    ...(options.tickers ? { tickers: options.tickers } : {}),
+    ...(options.top_n ? { top_n: options.top_n } : {}),
+    ...(options.cadences ? { cadences: options.cadences } : {}),
+    ...(options.eval_at_ms !== undefined ? { eval_at_ms: options.eval_at_ms } : {}),
+    ...(options.intraday_lookback_days !== undefined
+      ? { intraday_lookback_days: options.intraday_lookback_days }
+      : {}),
+  })
+}
+
+/** Build the SSE URL for the live scoring stream. The caller wires up
+ * `new EventSource(url)` directly because EventSource has no fetch-style
+ * options — query-string only.
+ *
+ * Cadence values supported by the engine (per spec): 60 (1m), 120 (2m),
+ * 300 (5m), 900 (15m). The math is identical at every cadence; only the
+ * runner's refresh interval changes.
+ */
+export function scoringStreamUrl(
+  provider: string,
+  options: {
+    tickers?: string[]
+    cadenceSeconds?: number
+    live?: boolean
+  } = {},
+): string {
+  const params = new URLSearchParams({ provider })
+  if (options.tickers && options.tickers.length) {
+    params.set('tickers', options.tickers.join(','))
+  }
+  if (options.cadenceSeconds !== undefined) {
+    params.set('cadence_seconds', String(options.cadenceSeconds))
+  }
+  if (options.live !== undefined) {
+    params.set('live', String(options.live))
+  }
+  return `${BASE_URL}/scoring/stream?${params.toString()}`
+}
+
+export interface ScoringStreamSnapshot {
+  rankings: ScoringResult[]
+  cadence_seconds: number
+}
+
+export interface ScoringStreamUpdate {
+  scanner_id: string
+  timestamp_ms: number
+  cadence_seconds: number
+  rankings: ScoringResult[]
+  rejected: ScoringRejection[]
+}
+
 export async function applyPreset(name: string): Promise<{ interval: string; lookback_days: number }> {
   const res = await fetch(`${BASE_URL}/config/preset/${encodeURIComponent(name)}`, {
     method: 'POST',

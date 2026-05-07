@@ -31,6 +31,47 @@ interface Props {
   /** Initial interval; user can change via the toolbar. Persisted per ticker. */
   defaultInterval?: Interval
   lookbackDays?: number
+  /** When set, the initial visible range is the last `viewWindowHours`
+   * of wall-clock time, clamped to the most recent 9:30 ET session start
+   * (so a stock viewed 90 min into the session doesn't show stale bars
+   * from yesterday's late-day chop). Falls back to `DEFAULT_VISIBLE_BARS`
+   * when unset. */
+  viewWindowHours?: number
+  /** Override for the EMA9 line color. Defaults to amber `#fbbf24`. */
+  ema9Color?: string
+  /** Set the chart's initial interval and resync whenever the prop
+   * changes — used by the Scoring tab to mirror the scanner cadence
+   * (1m / 2m / 5m / 15m). The TF toolbar stays clickable so the user
+   * can override on a per-view basis; overrides aren't persisted to
+   * localStorage when this is set, so flipping back via cadence change
+   * works as expected. */
+  lockedInterval?: Interval
+}
+
+/** Return the UTC ms timestamp of 09:30 ET on the calendar day containing
+ * `refMs`. DST-correct: derives the ET offset from the reference instant
+ * itself rather than hardcoding -5 / -4. */
+function sessionStartET930(refMs: number): number {
+  const dayParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+  }).format(new Date(refMs))
+  const [y, mo, da] = dayParts.split('-').map(Number)
+  // Find the ET offset at noon-UTC of that calendar day (always inside
+  // the trading day, never on a DST seam).
+  const noonUtc = Date.UTC(y, mo - 1, da, 12, 0, 0)
+  const etHour = Number(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour12: false,
+      hour: '2-digit',
+    })
+      .formatToParts(new Date(noonUtc))
+      .find((p) => p.type === 'hour')!.value,
+  )
+  // ET hour at UTC noon - 12 = ET offset in hours (e.g. 7 - 12 = -5 in EST).
+  const offsetHours = etHour - 12
+  // ET 9:30 = UTC (9:30 - offsetHours).
+  return Date.UTC(y, mo - 1, da, 9 - offsetHours, 30, 0)
 }
 
 const INTERVAL_SECONDS: Record<Interval, number> = {
@@ -166,6 +207,9 @@ export function RealtimeChart({
   ticker,
   defaultInterval = '1m',
   lookbackDays,
+  viewWindowHours,
+  ema9Color = '#fbbf24',
+  lockedInterval,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -208,8 +252,17 @@ export function RealtimeChart({
   const loadGenRef = useRef<number>(0)
 
   const [interval, setInterval] = useState<Interval>(() =>
-    loadInterval(ticker, defaultInterval),
+    lockedInterval ?? loadInterval(ticker, defaultInterval),
   )
+
+  // Sync to a changing `lockedInterval` (e.g. user picked a new cadence
+  // in the Scoring tab without remounting the chart).
+  useEffect(() => {
+    if (lockedInterval && lockedInterval !== interval) {
+      setInterval(lockedInterval)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lockedInterval])
   const [indicators, setIndicators] = useState<IndicatorState>(() => loadIndicators())
   const [error, setError] = useState<string | null>(null)
   const [streamConnected, setStreamConnected] = useState(false)
@@ -221,10 +274,13 @@ export function RealtimeChart({
    * the loaded history doesn't reach back into a prior session. */
   const [prevSessionClose, setPrevSessionClose] = useState<number | null>(null)
 
-  // Persist user's interval choice per ticker.
+  // Persist user's interval choice per ticker. When `lockedInterval` is
+  // active the interval is dictated by the parent (e.g. scanner cadence)
+  // and shouldn't bleed into the Trade tab's persisted preference.
   useEffect(() => {
+    if (lockedInterval) return
     window.localStorage.setItem(`${INTERVAL_KEY_PREFIX}.${ticker}`, interval)
-  }, [ticker, interval])
+  }, [ticker, interval, lockedInterval])
 
   useEffect(() => {
     window.localStorage.setItem(INDICATOR_KEY, JSON.stringify(indicators))
@@ -304,7 +360,7 @@ export function RealtimeChart({
     if (!chart) return
     if (indicators.ema9 && !ema9SeriesRef.current) {
       ema9SeriesRef.current = chart.addSeries(LineSeries, {
-        color: '#fbbf24', // amber
+        color: ema9Color,
         lineWidth: 1,
         priceLineVisible: false,
         lastValueVisible: false,
@@ -312,6 +368,9 @@ export function RealtimeChart({
     } else if (!indicators.ema9 && ema9SeriesRef.current) {
       chart.removeSeries(ema9SeriesRef.current)
       ema9SeriesRef.current = null
+    } else if (ema9SeriesRef.current) {
+      // Color prop changed while series already exists.
+      ema9SeriesRef.current.applyOptions({ color: ema9Color })
     }
     if (indicators.vwap && !vwapSeriesRef.current) {
       vwapSeriesRef.current = chart.addSeries(LineSeries, {
@@ -365,7 +424,7 @@ export function RealtimeChart({
       drawIndicators(barsRef.current)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [indicators])
+  }, [indicators, ema9Color])
 
   // 3. Load history + open SSE whenever ticker / interval changes.
   useEffect(() => {
@@ -413,14 +472,40 @@ export function RealtimeChart({
       `${BASE_URL}/quotes/history/${encodeURIComponent(ticker)}` +
       `?interval=${interval}&lookback_days=${lookback}`
 
-    fetch(url, { signal: controller.signal })
-      .then(async (r) => {
-        if (!r.ok) {
+    /** Auto-retry once after 1.5s on transient 502/503/504 — Polygon
+     * REST occasionally produces a brief outage that resolves quickly,
+     * and the server's internal 4-attempt retry loop runs over <8s of
+     * wall-clock so it can still exhaust if the bad window overlaps it.
+     * Without this client-side retry, the user has to manually click
+     * the symbol again. The server's 5xx for stable errors (auth, etc.)
+     * still surfaces — we don't retry on 4xx. */
+    const fetchWithRetry = async (): Promise<{ bars: Bar[] }> => {
+      let lastErr: unknown = null
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+          await new Promise((res) => setTimeout(res, 1500))
+        }
+        if (cancelled) throw new Error('cancelled')
+        try {
+          const r = await fetch(url, { signal: controller.signal })
+          if (r.ok) return (await r.json()) as { bars: Bar[] }
+          if (r.status >= 500 && r.status < 600 && attempt === 0) {
+            lastErr = new Error(`history ${r.status}`)
+            continue
+          }
           const text = await r.text().catch(() => '')
           throw new Error(`history ${r.status} ${text}`)
+        } catch (e) {
+          if ((e as Error).name === 'AbortError') throw e
+          lastErr = e
+          if (attempt === 0) continue
+          throw e
         }
-        return r.json() as Promise<{ bars: Bar[] }>
-      })
+      }
+      throw lastErr ?? new Error('history fetch failed')
+    }
+
+    fetchWithRetry()
       .then((data) => {
         if (cancelled) return
         barsRef.current = data.bars
@@ -457,11 +542,29 @@ export function RealtimeChart({
         // a "live" window without re-snapping after every tick.
         const totalBars = data.bars.length
         if (totalBars > 0) {
-          const visibleBars = DEFAULT_VISIBLE_BARS[interval]
-          chartRef.current?.timeScale().setVisibleLogicalRange({
-            from: Math.max(0, totalBars - visibleBars),
-            to: totalBars,
-          })
+          if (viewWindowHours && viewWindowHours > 0) {
+            // Time-window mode: show the last `viewWindowHours` of
+            // wall-clock time, clamped to the most recent 9:30 ET so
+            // we never bleed into yesterday's bars when the session is
+            // still young.
+            const lastBar = data.bars[totalBars - 1]
+            const toSec = lastBar.time
+            const windowAgoSec = toSec - viewWindowHours * 3600
+            const session930Sec = Math.floor(
+              sessionStartET930(toSec * 1000) / 1000,
+            )
+            const fromSec = Math.max(windowAgoSec, session930Sec)
+            chartRef.current?.timeScale().setVisibleRange({
+              from: fromSec as UTCTimestamp,
+              to: toSec as UTCTimestamp,
+            })
+          } else {
+            const visibleBars = DEFAULT_VISIBLE_BARS[interval]
+            chartRef.current?.timeScale().setVisibleLogicalRange({
+              from: Math.max(0, totalBars - visibleBars),
+              to: totalBars,
+            })
+          }
         }
       })
       .catch((e) => {
@@ -516,7 +619,7 @@ export function RealtimeChart({
       tsApi?.unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ticker, interval, lookbackDays])
+  }, [ticker, interval, lookbackDays, viewWindowHours])
 
   /** Upsert the live-price horizontal line at the given price. Color
    * follows the move vs prior session's close so the visual matches
