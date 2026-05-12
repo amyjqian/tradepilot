@@ -122,7 +122,13 @@ class PolygonRunnerFeed:
         if kind == "AM":
             bar = am_event_to_bar(ev)
             if bar is not None:
+                log.info(
+                    "AM %s close=%d o=%.4f h=%.4f l=%.4f c=%.4f v=%.0f",
+                    symbol, bar.ts_ms, bar.open, bar.high, bar.low, bar.close, bar.volume,
+                )
                 self._runner.on_minute_bar(symbol, bar)
+            else:
+                log.warning("AM %s: dropped — could not parse %r", symbol, ev)
         elif kind == "Q":
             quote = parse_quote(ev)
             if quote is None:
